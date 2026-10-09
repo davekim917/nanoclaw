@@ -691,7 +691,8 @@ describe('task list delivery (switch on)', () => {
   });
 
   describe('a superseded list post', () => {
-    type Deleted = { platformId: string; threadId: string | null; messageId: string };
+    type Deleted = { channelType: string; platformId: string; threadId: string | null; messageId: string };
+    const STUB = { operation: 'edit', messageId: 'plat-1', text: 'Latest task list below ↓' };
     function deletingAdapter(deleteImpl?: () => Promise<void>): { calls: Call[]; deleted: Deleted[] } {
       const calls: Call[] = [];
       const deleted: Deleted[] = [];
@@ -700,49 +701,59 @@ describe('task list delivery (switch on)', () => {
           calls.push({ kind, threadId, content: JSON.parse(content) as Record<string, unknown> });
           return `plat-${calls.length}`;
         },
-        async deleteMessage(_channelType, platformId, threadId, messageId) {
-          deleted.push({ platformId, threadId, messageId });
+        async deleteMessage(channelType, platformId, threadId, messageId) {
+          deleted.push({ channelType, platformId, threadId, messageId });
           await deleteImpl?.();
         },
       });
       return { calls, deleted };
     }
-    const retire = (sessionId: string, id = 'retire-1', messageId = '1786621600.000100', timestamp = now()) =>
-      insertRow(sessionId, id, 'task_list', { operation: 'delete', messageId }, { timestamp });
-
-    it('is deleted, with no edit', async () => {
-      const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      const { calls, deleted } = deletingAdapter();
-      retire(sessionId);
+    /** The host delivers the list post (platform id `plat-1`), recording where it went. */
+    async function postList(sessionId: string) {
+      insertRow(
+        sessionId,
+        'list-1',
+        'task_list',
+        { text: 'T\n✱ A' },
+        { timestamp: new Date(Date.now() - 1000).toISOString() },
+      );
       const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
       await deliverSessionMessages(session);
-      expect(deleted).toEqual([{ platformId: PLATFORM, threadId: THREAD, messageId: '1786621600.000100' }]);
-      expect(calls).toEqual([]);
+      return session;
+    }
+    const retire = (
+      sessionId: string,
+      id = 'retire-1',
+      messageId = 'plat-1',
+      route: { threadId?: string | null } = {},
+    ) => insertRow(sessionId, id, 'task_list', { operation: 'delete', messageId }, route);
+
+    it('is deleted on the route the host delivered it on, with no edit', async () => {
+      const sessionId = await seed();
+      const { calls, deleted } = deletingAdapter();
+      const session = await postList(sessionId);
+      // The delete row's own route is container-written and is not used.
+      retire(sessionId, 'retire-1', 'plat-1', { threadId: 'slack:C0AAA:1786621514.999999' });
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([{ channelType: 'slack', platformId: PLATFORM, threadId: THREAD, messageId: 'plat-1' }]);
+      expect(calls.map((c) => c.content.operation)).toEqual([undefined]);
       expect(await delivered(sessionId)).toContain('retire-1');
     });
 
     it('is edited to the plain stub, with no link, when the delete fails', async () => {
       const sessionId = await seed();
-      seedDeliveredList(sessionId);
       const warn = vi.spyOn(log, 'warn');
       const { calls, deleted } = deletingAdapter(async () => {
         throw new Error('slack cant_delete_message');
       });
+      const session = await postList(sessionId);
       retire(sessionId);
-      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
       await deliverSessionMessages(session);
       expect(deleted).toHaveLength(1);
-      expect(calls).toEqual([
-        {
-          kind: 'task_list',
-          threadId: THREAD,
-          content: { operation: 'edit', messageId: '1786621600.000100', text: 'Latest task list below ↓' },
-        },
-      ]);
+      expect(calls.slice(1)).toEqual([{ kind: 'task_list', threadId: THREAD, content: STUB }]);
       expect(warn).toHaveBeenCalledWith(
         'Failed to delete a superseded task list — editing it to a stub',
-        expect.objectContaining({ messageId: '1786621600.000100' }),
+        expect.objectContaining({ messageId: 'plat-1' }),
       );
       expect(await delivered(sessionId)).toContain('retire-1');
       warn.mockRestore();
@@ -750,52 +761,60 @@ describe('task list delivery (switch on)', () => {
 
     it('is edited to the plain stub when the adapter cannot delete', async () => {
       const sessionId = await seed();
-      seedDeliveredList(sessionId);
       const calls = captureAdapter();
+      const session = await postList(sessionId);
       retire(sessionId);
-      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
       await deliverSessionMessages(session);
-      expect(calls.map((c) => c.content)).toEqual([
-        { operation: 'edit', messageId: '1786621600.000100', text: 'Latest task list below ↓' },
-      ]);
+      expect(calls.slice(1).map((c) => c.content)).toEqual([STUB]);
     });
 
-    it('never deletes or edits a message the session did not deliver as a list post', async () => {
+    it('never deletes or edits a message the host did not deliver as a list post', async () => {
       const sessionId = await seed();
-      seedDeliveredList(sessionId);
-      insertRow(sessionId, 'answer', 'chat', { text: 'An answer' });
-      recordDelivered(sessionId, 'answer', '1786621600.000200');
       const { calls, deleted } = deletingAdapter();
-      retire(sessionId, 'forged-chat', '1786621600.000200');
-      retire(sessionId, 'forged-unknown', '1786621699.000999');
+      insertRow(sessionId, 'answer', 'chat', { text: 'An answer' });
       const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
       await deliverSessionMessages(session);
+      expect(calls).toHaveLength(1);
+      // The container rewrites its own delivered answer row to look like a list post.
+      const db = outbound(sessionId);
+      db.prepare("UPDATE messages_out SET kind = 'task_list', content = ? WHERE id = 'answer'").run(
+        JSON.stringify({ text: 'T' }),
+      );
+      db.close();
+      retire(sessionId, 'forged-answer', 'plat-1');
+      retire(sessionId, 'forged-unknown', '1786621699.000999');
+      await deliverSessionMessages(session);
       expect(deleted).toEqual([]);
-      expect(calls).toEqual([]);
+      expect(calls).toHaveLength(1);
       const done = await delivered(sessionId);
-      expect(done).toContain('forged-chat');
+      expect(done).toContain('forged-answer');
       expect(done).toContain('forged-unknown');
     });
 
     it('waits out a rate-limited delete, even past an answer, and never falls back to the stub', async () => {
       const sessionId = await seed();
-      seedDeliveredList(sessionId);
       let limited = true;
       const { calls, deleted } = deletingAdapter(async () => {
         if (limited) throw new Error('slack rate_limited: Retry-After: 1');
       });
+      const session = await postList(sessionId);
       const base = Date.now();
-      retire(sessionId, 'retire-1', '1786621600.000100', new Date(base).toISOString());
+      insertRow(
+        sessionId,
+        'retire-1',
+        'task_list',
+        { operation: 'delete', messageId: 'plat-1' },
+        { timestamp: new Date(base).toISOString() },
+      );
       insertRow(sessionId, 'answer', 'chat', { text: 'Done.' }, { timestamp: new Date(base + 1).toISOString() });
-      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
       await deliverSessionMessages(session);
-      expect(calls.map((c) => c.kind)).toEqual(['chat']);
+      expect(calls.map((c) => c.kind)).toEqual(['task_list', 'chat']);
       expect(await delivered(sessionId)).not.toContain('retire-1');
       limited = false;
       await new Promise((r) => setTimeout(r, 1_100));
       await deliverSessionMessages(session);
       expect(deleted).toHaveLength(2);
-      expect(calls.map((c) => c.kind)).toEqual(['chat']);
+      expect(calls.map((c) => c.kind)).toEqual(['task_list', 'chat']);
       expect(await delivered(sessionId)).toContain('retire-1');
     });
   });

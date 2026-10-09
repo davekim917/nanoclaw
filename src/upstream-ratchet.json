@@ -979,7 +979,7 @@
 "src/delivery-poll.test.ts":{"diff":194,"mode":"100644","sha256":null,"deleted":true},
 "src/delivery-shadow.test.ts":{"diff":141,"mode":"100644","sha256":null,"deleted":true},
 "src/delivery.test.ts":{"diff":4025,"mode":"100644","sha256":"c568af823c4d3c1c25afa7273ddffcca9bd0d123c06e76be7a059c037113c1ea"},
-"src/delivery.ts":{"diff":1841,"mode":"100644","sha256":"9175c6b3426c375baa386f8ee33acef79c4ef07ead1e00a6fa75d804e731ee06"},
+"src/delivery.ts":{"diff":1853,"mode":"100644","sha256":"d60028897fe0fa9932b460e9c3696f36a99527fa1094d1d94c2a0ce1ce744a94"},
 "src/drivers/cli.test.ts":{"diff":33,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/cli.ts":{"diff":88,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/conformance.test.ts":{"diff":783,"mode":"100644","sha256":null,"deleted":true},

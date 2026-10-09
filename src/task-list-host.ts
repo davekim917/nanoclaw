@@ -9,7 +9,7 @@ import { withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
-import type { TaskListSettlement } from './modules/mailbox/ops/lookups.js';
+import type { TaskListPostRoute, TaskListSettlement } from './modules/mailbox/ops/lookups.js';
 import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { takesAWake } from './modules/sweep-continuation/kill-state.js';
 import { scrubSecrets } from './secret-scrubber.js';
@@ -41,41 +41,54 @@ export function supersededTaskListEdits(
   return superseded;
 }
 
-/** What a superseded list post is edited to where it cannot be deleted. Plain text: a link can 404. */
 const TASK_LIST_SUPERSEDED_STUB = 'Latest task list below ↓';
 
+/** The route a task-list POST was delivered on, recorded host-side so retiring it never trusts the container. */
+export function taskListPostReceipt(
+  kind: string,
+  content: { operation?: unknown },
+  channelType: string,
+  platformId: string,
+  threadId: string | null,
+  instance: string | undefined,
+): { taskListRoute?: string } {
+  if (kind !== 'task_list' || content.operation !== undefined) return {};
+  const route: TaskListPostRoute = { channelType, platformId, threadId, instance: instance ?? null };
+  return { taskListRoute: JSON.stringify(route) };
+}
+
 /**
- * A task_list `delete` row: the runner's list post replaced by a newer one. Deleted when the target is a list post
- * this session delivered; where the adapter cannot delete or the delete throws, edited to a plain stub instead. A
- * rate limit is rethrown so the row cools down and is retried whole.
+ * Deleted on the route its post was delivered on; where the adapter cannot delete or the delete throws, edited to
+ * a plain stub. A rate limit is rethrown so the row cools down and is retried whole.
  */
-async function retireSupersededTaskList(
+export async function retireSupersededTaskList(
   adapter: ChannelDeliveryAdapter,
   session: Session,
   msg: { id: string; content: string },
-  route: { channelType: string; platformId: string; threadId: string | null; instance: string | undefined },
-): Promise<undefined> {
-  const { channelType, platformId, threadId, instance } = route;
+): Promise<{ recordOnly: true }> {
   const messageId = (JSON.parse(msg.content) as { messageId?: unknown }).messageId;
-  const owned =
-    typeof messageId === 'string' &&
-    (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.isDeliveredTaskListPost(messageId, channelType, platformId),
-    )) === true;
-  if (!owned) {
+  const route =
+    typeof messageId === 'string'
+      ? await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox.getTaskListPostRoute(messageId),
+        )
+      : null;
+  if (!route || typeof messageId !== 'string') {
     log.warn('Task list delete refused — target is not a list post this session delivered', {
       id: msg.id,
       sessionId: session.id,
     });
-    return undefined;
+    return { recordOnly: true };
   }
+  const { channelType, platformId, threadId } = route;
+  const instance = route.instance ?? undefined;
   const context = { id: msg.id, sessionId: session.id, messageId };
   if (!adapter.deleteMessage) {
     log.warn('Adapter cannot delete a superseded task list — editing it to a stub', context);
   } else {
     try {
       await adapter.deleteMessage(channelType, platformId, threadId, messageId, instance);
-      return undefined;
+      return { recordOnly: true };
     } catch (err) {
       if (parseRetryAfterMs(err) !== null) throw err;
       log.warn('Failed to delete a superseded task list — editing it to a stub', {
@@ -93,19 +106,7 @@ async function retireSupersededTaskList(
     undefined,
     instance,
   );
-  return undefined;
-}
-
-/** Delivers a task_list `delete` row: its `deliver` retires the row's target instead of posting. */
-export function retiringTaskListAdapter(
-  adapter: ChannelDeliveryAdapter,
-  session: Session,
-  msg: { id: string; content: string },
-): Pick<ChannelDeliveryAdapter, 'deliver'> {
-  return {
-    deliver: (channelType, platformId, threadId, _kind, _content, _files, instance) =>
-      retireSupersededTaskList(adapter, session, msg, { channelType, platformId, threadId, instance }),
-  };
+  return { recordOnly: true };
 }
 
 const KILL_EDIT_MAX_ATTEMPTS = 4;
@@ -302,7 +303,6 @@ export function typingStatusFor(sessionId: string): string | undefined {
   return clipStatusText(`is working: ${item}`);
 }
 
-/** A row with no activeText (an edit or delete of a replaced post) leaves the status item alone. */
 export function noteTaskListDelivered(sessionId: string, content: Record<string, unknown>): void {
   const meta = content.taskList as { activeText?: unknown } | undefined;
   if (meta && 'activeText' in meta) {

@@ -257,7 +257,6 @@ export async function applyTaskListUpdate(
   const finished = input.items.every((item) => item.status === 'done');
   const text = renderBody(input.title, input.items);
   const subtext = renderSubtext(routing.channelType, now);
-  // The host deletes the old post, falling back to a plain stub edit where it cannot.
   const retire = async (messageId: string): Promise<void> => {
     await deps.write({ operation: 'delete', messageId }, routing);
   };
