@@ -1624,7 +1624,9 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
   if (hasPendingConversion(pkgDir)) return 'failed';
 
   const entryExists = isRealDir(pkg.entryDir);
-  const wouldBe = entryExists ? undefined : pass.wouldSeal.get(pkg.entryDir);
+  const wouldBe = pass.wouldSeal.get(pkg.entryDir);
+  // The would-be entry's source: adopt would have made it the first farm.
+  if (wouldBe?.source === pkgDir) return 'farm';
   if (entryExists) {
     const verified = verifyOnce(pass, pkg.entryDir);
     if (!verified.ok) {
@@ -1632,9 +1634,6 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
       return 'quarantined';
     }
     if (sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed)) return 'farm';
-  } else if (wouldBe?.source === pkgDir) {
-    // The would-be entry's source: adopt would have made it the first farm.
-    return 'farm';
   } else if (
     quarantinedDirsFor(pass, workgroupId, pkg.key).some((dir) => sharesEntryInodes(pkg.nodeModulesDir, dir, null))
   ) {
@@ -1657,29 +1656,22 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
       quarantineEntry(pass, pkg.entryDir, verified);
       return 'quarantined';
     }
-    if (!parseInstallStamp(verified.sealed.installStamp)) return adoptIfStamped(pass, pkg, completeness);
-    return convertVerified(
-      pass,
-      pkg,
-      verified.sealed,
-      path.join(pkg.entryDir, NODE_MODULES),
-      verified.sealed,
-      completeness,
-    );
+    if (parseInstallStamp(verified.sealed.installStamp)) {
+      return convertVerified(
+        pass,
+        pkg,
+        verified.sealed,
+        path.join(pkg.entryDir, NODE_MODULES),
+        verified.sealed,
+        completeness,
+      );
+    }
   }
   if (wouldBe) return convertVerified(pass, pkg, wouldBe, path.join(wouldBe.source, NODE_MODULES), null, completeness);
-  return adoptIfStamped(pass, pkg, completeness);
-}
-
-function adoptIfStamped(
-  pass: DependencyCachePass,
-  pkg: PreparedPackage,
-  completeness: { walk: TreeWalk; inventory: Inventory },
-): PackageOutcome {
   const installStamp = adoptableStamp(pkg);
   if (!installStamp) {
     // An entry is linked into checkouts that never installed it, so it must be a tree whose lifecycle scripts ran.
-    decide(pass, 'unstamped', pkg.pkgDir, { key: pkg.key, detail: `no ${INSTALL_STAMP_NAME} matching this tree` });
+    decide(pass, 'unstamped', pkgDir, { key: pkg.key, detail: `no ${INSTALL_STAMP_NAME} matching this tree` });
     return 'unstamped';
   }
   return adopt(pass, pkg, completeness, installStamp);

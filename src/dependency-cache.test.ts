@@ -683,6 +683,26 @@ describe('install stamps', () => {
     expect(cacheEntries('wg-a')).toEqual([keyOf(src)]);
   });
 
+  it('a report pass over a key sealed without a stamp reports one adopt, then a convert for each later same-key tree', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    const key = keyOf(src);
+    stripEntryStamp(path.join(cacheRoot, 'wg-a', key));
+    const first = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    const second = makeProject(path.join(tmpRoot, 'topic-c', 'repo'));
+    const before = snapshotTree(second);
+    const pass = startPass('report');
+
+    expect(processPackageDir(pass, 'wg-a', first)).toBe('adopted');
+    expect(processPackageDir(pass, 'wg-a', second)).toBe('converted');
+    expect(processPackageDir(pass, 'wg-a', first)).toBe('farm');
+
+    expect(pass.counters.adopted).toBe(1);
+    expect(pass.counters.converted).toBe(1);
+    expect(cacheEntries('wg-a')).toEqual([key]);
+    expect(snapshotTree(second)).toEqual(before);
+  });
+
   it('a stamped tree re-adopts a key sealed without a stamp, leaving the old entry to GC and its farms their files', () => {
     const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
     expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
