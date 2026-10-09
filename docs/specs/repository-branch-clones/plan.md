@@ -514,16 +514,31 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   - the inventory equals the one recorded in `SEALED`.
 
   Any failure quarantines the entry (§5.7.6).
-- **Adopt.** For a complete, untampered tree with no sealed entry for its key:
+- **Install stamp.** `node_modules/.install-stamp.json` is a private root dot entry that the tool
+  running `npm ci` writes only after an install that ran lifecycle scripts: `v` (1), `lockSha256`,
+  `pkgSha256`, `npmrcSha256` (null without `.npmrc`), `node`, `npm`, `platform`, `arch`, `libc`,
+  `scripts` (true), `writer`, `at`. A stamp passes the skip test when it parses, `v` is 1,
+  `scripts` is true, and the three package-dir digests, node major.minor, platform, arch and libc
+  equal fresh values; the cache takes the environment values from the agent image's fingerprint
+  and glibc. A reader skips `npm ci` only on a pass.
+- **Adopt.** For a complete, untampered tree with no sealed entry for its key, or, when the tree's
+  install stamp passes the skip test, with only an entry sealed without a stamp. Stamps gate only
+  where they exist: a key that no stamped tree has reached adopts, links and converts unstamped,
+  exactly as before stamps, and writes no stamp. Once a stamped tree of the key arrives, it takes
+  the key over here, and links and converts from then on stamp each copy:
   1. link it into `<key>.tmp/node_modules`, skipping private dot entries, and copying the
      hidden lockfile instead of linking it;
   2. `chmod a-w` every regular file in the entry;
   3. write `SEALED` with the key inputs, the source, `sealedAt`, the inventory with its sha256,
-     and the content manifest's sha256 (from one read of the tree);
-  4. rename `<key>.tmp` to `<key>`.
+     the content manifest's sha256 (from one read of the tree), and the source's install stamp
+     when it passes the skip test;
+  4. rename an entry sealed without a stamp from `<key>` to `<key>.quarantined-<ms>`, deleting
+     nothing: quarantine GC removes it, and farms linked to it keep their files;
+  5. rename `<key>.tmp` to `<key>`.
 
   A link failure (`EPERM`/`EXDEV`) aborts with the tree untouched and a WARN.
-- **Convert (M3).** For a complete private tree whose key has a verified entry, and whose
+- **Convert (M3).** For a complete private tree whose key has a verified entry that it does not
+  take over (Adopt), and whose
   inventory and content both equal the entry's, so only byte-identical installs merge (rev 2.2),
   apart from per-install files, which need only the same path and type (rev 2.8). Content is
   compared file by file against the entry, stopping at the first difference, which the
@@ -540,6 +555,10 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   3. rename `.new` to `node_modules`;
   4. move each private root dot entry from `.old` into `node_modules`, one rename each;
   5. delete `.old` only when it holds no private root dot entry.
+
+  Then, when the farm keeps no per-install file of its own except the hidden lockfile, stamp the
+  workspace (below). A kept build output is the workspace's own, which the entry's stamp does not
+  vouch for.
 - **Recovery**, run first on every pass for every package dir that has either temp name:
   - `node_modules` missing and `.old` present: rename `.old` back. Private entries have not moved
     yet, because step 4 only runs after step 3.
@@ -555,7 +574,12 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   After step 3, or midway through step 4, it completes the move. The same pass may then convert
   again.
 - **Link.** For a package dir with no `node_modules` whose key has a verified entry: link it to
-  `.new`, then rename to `node_modules`.
+  `.new`, stamp `.new` (below), then rename to `node_modules`.
+- **Stamp a workspace.** Write the entry's install stamp with `lockSha256`, `pkgSha256` and
+  `npmrcSha256` recomputed from the workspace's own package dir, only when the result passes the
+  skip test there, and never over a stamp the workspace already holds. An entry sealed without a
+  stamp stamps nothing, so checks reinstall there until a stamped tree of its key takes it over
+  (Adopt). Stamping is best effort: a missing stamp costs a reinstall.
 - **Already a farm.** The first regular file in the entry's inventory that is not a per-install
   file shares its inode with the workspace's copy. Nothing to do. A tree with no such file is
   never adopted, because nothing could prove it a farm (rev 2.8).

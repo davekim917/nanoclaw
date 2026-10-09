@@ -207,6 +207,7 @@ import {
   runRepositoryActionDetached,
 } from './job-runner.js';
 import { initMigratedTestDb } from '../../db/index.js';
+import { writeInstallStamp } from '../../test-install-stamp.js';
 
 /** In-memory inbound for action responses, and the delivery acks the job runner writes. */
 const mailboxInbound = new Map<string, { id: string; content: string }>();
@@ -2543,6 +2544,7 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       }),
     );
     fs.utimesSync(path.join(nm, '.package-lock.json'), hourAgo + 30, hourAgo + 30);
+    writeInstallStamp(dir);
   }
 
   function checkout(

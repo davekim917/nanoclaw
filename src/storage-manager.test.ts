@@ -62,6 +62,7 @@ import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { log } from './log.js';
 import { sessionContextPathFor } from './session-manager.js';
+import { writeInstallStamp } from './test-install-stamp.js';
 
 // The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
 // intercepts the `node:`-prefixed specifier too, so a plain import would just
@@ -3564,6 +3565,7 @@ describe('storage-manager regenerable tree sweep', () => {
       JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages }),
     );
     fs.utimesSync(hidden, old + 30, old + 30);
+    writeInstallStamp(repoDir);
     ageTopic(topicDir, idleDays);
     return { topicDir, repoDir };
   }
@@ -3670,6 +3672,21 @@ describe('storage-manager regenerable tree sweep', () => {
       fs.lstatSync(path.join(lateControl.repoDir, 'node_modules', 'left-pad', 'index.js')).ino,
     );
     expect(lateReport.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 0 }));
+  });
+
+  it('exempts the farm of an unstamped install from the 2-day delete', () => {
+    enableDependencyCache();
+    const { repoDir } = makeNpmTopic('thread-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2');
+    fs.rmSync(path.join(repoDir, 'node_modules', '.install-stamp.json'));
+
+    const first = sweep();
+    _resetStorageManagerThrottleForTesting();
+    const second = sweep();
+
+    expect(first.dependencyCache?.counters.adopted).toBe(1);
+    expect(first.actions).toEqual([]);
+    expect(second.actions).toEqual([]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toContain('left-pad');
   });
 
   it('exempts a farm from the 2-day delete and sweeps the farm of a quarantined entry', () => {

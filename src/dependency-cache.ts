@@ -61,6 +61,11 @@ export function envFingerprint(nodeVersion: string, arch: string = INSTALL_PLATF
   return `node=${nodeVersion};platform=${INSTALL_PLATFORM.os};arch=${arch}`;
 }
 
+function parseFingerprint(fingerprint: string): { node: string; platform: string; arch: string } | null {
+  const match = /^node=([^;]+);platform=([^;]+);arch=([^;]+)$/.exec(fingerprint);
+  return match ? { node: match[1]!, platform: match[2]!, arch: match[3]! } : null;
+}
+
 /**
  * The agent image's NODE_VERSION plus linux/arch, memoized on success. `null` when uninspectable: callers skip the
  * pass rather than guess.
@@ -163,11 +168,16 @@ function sha256(bytes: Buffer | string): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-/** §5.7.2: length-framed sha256 of lockfile, package.json, `.npmrc` and fingerprint. `null` when unreadable. */
-export function dependencyKey(pkgDir: string, fingerprint: string): { key: string; inputs: KeyInputs } | null {
+interface PackageFiles {
+  lock: Buffer;
+  manifest: Buffer;
+  /** `null` when the package dir has no `.npmrc`. */
+  npmrc: Buffer | null;
+}
+
+function readPackageFiles(pkgDir: string): PackageFiles | null {
   let lock: Buffer;
   let manifest: Buffer;
-  let npmrc: Buffer;
   try {
     lock = fs.readFileSync(path.join(pkgDir, 'package-lock.json'));
     manifest = fs.readFileSync(path.join(pkgDir, 'package.json'));
@@ -175,11 +185,18 @@ export function dependencyKey(pkgDir: string, fingerprint: string): { key: strin
     return null;
   }
   try {
-    npmrc = fs.readFileSync(path.join(pkgDir, '.npmrc'));
+    return { lock, manifest, npmrc: fs.readFileSync(path.join(pkgDir, '.npmrc')) };
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
-    npmrc = Buffer.alloc(0);
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { lock, manifest, npmrc: null } : null;
   }
+}
+
+/** §5.7.2: length-framed sha256 of lockfile, package.json, `.npmrc` and fingerprint. `null` when unreadable. */
+export function dependencyKey(pkgDir: string, fingerprint: string): { key: string; inputs: KeyInputs } | null {
+  const files = readPackageFiles(pkgDir);
+  if (!files) return null;
+  const { lock, manifest } = files;
+  const npmrc = files.npmrc ?? Buffer.alloc(0);
   const hash = createHash('sha256');
   for (const [label, bytes] of [
     ['package-lock.json', lock],
@@ -199,6 +216,95 @@ export function dependencyKey(pkgDir: string, fingerprint: string): { key: strin
       fingerprint,
     },
   };
+}
+
+/**
+ * The install stamp contract shared with the repos that run `npm ci`: written by that tool only after an `npm ci`
+ * that ran lifecycle scripts, as a private root dot entry, so a reader may skip `npm ci` when every field it checks
+ * equals a fresh computation. `--ignore-scripts` installs of one lockfile leave native bindings unbuilt.
+ */
+const INSTALL_STAMP_NAME = '.install-stamp.json';
+
+interface InstallStamp {
+  v: 1;
+  lockSha256: string;
+  pkgSha256: string;
+  npmrcSha256: string | null;
+  node: string;
+  npm: string;
+  platform: string;
+  arch: string;
+  libc: string | null;
+  scripts: true;
+  writer: string;
+  at: string;
+}
+
+function parseInstallStamp(raw: unknown): InstallStamp | null {
+  if (!isJsonObject(raw) || raw.v !== 1 || raw.scripts !== true) return null;
+  const strings = ['lockSha256', 'pkgSha256', 'node', 'npm', 'platform', 'arch', 'writer', 'at'] as const;
+  if (strings.some((field) => typeof raw[field] !== 'string')) return null;
+  for (const field of ['npmrcSha256', 'libc'] as const) {
+    if (raw[field] !== null && typeof raw[field] !== 'string') return null;
+  }
+  const stamp = raw as unknown as InstallStamp;
+  return {
+    v: 1,
+    lockSha256: stamp.lockSha256,
+    pkgSha256: stamp.pkgSha256,
+    npmrcSha256: stamp.npmrcSha256,
+    node: stamp.node,
+    npm: stamp.npm,
+    platform: stamp.platform,
+    arch: stamp.arch,
+    libc: stamp.libc,
+    scripts: true,
+    writer: stamp.writer,
+    at: stamp.at,
+  };
+}
+
+type StampPackageFields = Pick<InstallStamp, 'lockSha256' | 'pkgSha256' | 'npmrcSha256'>;
+
+/**
+ * The stamp fields a package dir's own bytes give, or `null` when those bytes no longer produce `inputs`: the dir
+ * changed after it was keyed, so a stamp could describe another key's tree.
+ */
+function stampPackageFields(pkgDir: string, inputs: KeyInputs): StampPackageFields | null {
+  const files = readPackageFiles(pkgDir);
+  if (!files) return null;
+  const fields: StampPackageFields = {
+    lockSha256: sha256(files.lock),
+    pkgSha256: sha256(files.manifest),
+    npmrcSha256: files.npmrc ? sha256(files.npmrc) : null,
+  };
+  const keyed =
+    fields.lockSha256 === inputs.packageLockSha256 &&
+    fields.pkgSha256 === inputs.packageJsonSha256 &&
+    (fields.npmrcSha256 ?? sha256(Buffer.alloc(0))) === inputs.npmrcSha256;
+  return keyed ? fields : null;
+}
+
+function majorMinor(version: string): string | null {
+  const match = /^v?(\d+)\.(\d+)(\.|$)/.exec(version);
+  return match ? `${match[1]}.${match[2]}` : null;
+}
+
+/** The contract's skip test, against the agent image's environment: what a check inside the container computes. */
+function stampMatches(stamp: InstallStamp, fields: StampPackageFields, fingerprint: string): boolean {
+  const env = parseFingerprint(fingerprint);
+  const node = env && majorMinor(env.node);
+  return (
+    env !== null &&
+    node !== null &&
+    stamp.lockSha256 === fields.lockSha256 &&
+    stamp.pkgSha256 === fields.pkgSha256 &&
+    stamp.npmrcSha256 === fields.npmrcSha256 &&
+    majorMinor(stamp.node) === node &&
+    stamp.platform === env.platform &&
+    stamp.arch === env.arch &&
+    stamp.libc === LINK_PLATFORM.libc
+  );
 }
 
 type InventoryItem = [relativePath: string, type: 'f' | 'l', size: number];
@@ -543,6 +649,8 @@ interface SealedRecord {
   inventory: InventoryItem[];
   /** `contentManifestSha256` of the sealed tree; identifies the entry a remembered convert mismatch was against. */
   contentSha256: string;
+  /** The source tree's install stamp at adoption; absent on entries sealed before stamps gated adoption. */
+  installStamp?: unknown;
 }
 
 interface EntryIdentity {
@@ -554,6 +662,7 @@ interface EntryIdentity {
 /** What a report pass would have sealed, so later same-key trees report their convert. */
 interface WouldSealEntry extends EntryIdentity {
   source: string;
+  stamped: boolean;
 }
 
 export type VerifyResult =
@@ -781,7 +890,7 @@ function quarantineEntry(
     log.warn('dependency-cache: would quarantine entry', { entry: entryDir, ...failure });
     return;
   }
-  const quarantinedAs = `${entryDir}.quarantined-${Date.now()}`;
+  const quarantinedAs = quarantinedPath(entryDir);
   try {
     fs.renameSync(entryDir, quarantinedAs);
   } catch (err) {
@@ -790,6 +899,10 @@ function quarantineEntry(
     return;
   }
   log.warn('dependency-cache: quarantined entry', { entry: entryDir, quarantinedAs, ...failure });
+}
+
+function quarantinedPath(entryDir: string): string {
+  return `${entryDir}.quarantined-${Date.now()}`;
 }
 
 function quarantinedDirsFor(pass: DependencyCachePass, workgroupId: string, key: string): string[] {
@@ -918,6 +1031,36 @@ function linkTree(src: string, dst: string): void {
   } catch (err) {
     fs.rmSync(dst, { recursive: true, force: true });
     throw err;
+  }
+}
+
+function adoptableStamp(pkg: PreparedPackage): InstallStamp | null {
+  const stamp = parseInstallStamp(readJsonObject(path.join(pkg.nodeModulesDir, INSTALL_STAMP_NAME)));
+  const fields = stampPackageFields(pkg.pkgDir, pkg.inputs);
+  return stamp && fields && stampMatches(stamp, fields, pkg.fingerprint) ? stamp : null;
+}
+
+/**
+ * Writes the entry's stamp, with the copy's own package-dir fields, into a tree that now holds the entry's
+ * content, when it passes the skip test there. Never replaces a stamp already in `nodeModulesDir`: that is the
+ * workspace's own private file. Best effort: a missing stamp only costs a reinstall.
+ */
+function stampCopy(pkg: PreparedPackage, nodeModulesDir: string, sealed: SealedRecord): void {
+  const entryStamp = parseInstallStamp(sealed.installStamp);
+  if (!entryStamp) return;
+  const fields = stampPackageFields(pkg.pkgDir, pkg.inputs);
+  if (!fields || !stampMatches(entryStamp, fields, pkg.fingerprint)) return;
+  const target = path.join(nodeModulesDir, INSTALL_STAMP_NAME);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ ...entryStamp, ...fields }));
+    fs.linkSync(tmp, target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+      log.warn('dependency-cache: could not write install stamp', { path: pkg.pkgDir, err: errorMessage(err) });
+    }
+  } finally {
+    fs.rmSync(tmp, { force: true });
   }
 }
 
@@ -1146,6 +1289,7 @@ interface PreparedPackage {
   nodeModulesDir: string;
   key: string;
   inputs: KeyInputs;
+  fingerprint: string;
   entryDir: string;
 }
 
@@ -1164,6 +1308,7 @@ function preparePackage(
     nodeModulesDir: path.join(pkgDir, NODE_MODULES),
     key: keyed.key,
     inputs: keyed.inputs,
+    fingerprint,
     entryDir: path.join(workgroupDir(pass, workgroupId), keyed.key),
   };
 }
@@ -1183,18 +1328,24 @@ function deferIfCapped(pass: DependencyCachePass, pkg: PreparedPackage): boolean
 }
 
 /**
- * Adopt (§5.7.4): link into `<key>.tmp/node_modules`, `chmod a-w`, write SEALED, rename to `<key>`. The source
- * becomes the entry's first farm. A report pass records what it would seal, so later same-key trees report a
- * convert, not a second adopt.
+ * Adopt (§5.7.4): link into `<key>.tmp/node_modules`, `chmod a-w`, write SEALED with the source's install stamp
+ * when it has one, rename to `<key>`. The source becomes the entry's first farm. A report pass records what it would
+ * seal, so later same-key trees report a convert, not a second adopt. An entry already at `<key>` (one sealed without
+ * a stamp, replaced by a stamped tree) is renamed to a quarantined name for GC.
  */
 function adopt(
   pass: DependencyCachePass,
   pkg: PreparedPackage,
   completeness: { walk: TreeWalk; inventory: Inventory },
+  installStamp: InstallStamp | null,
 ): PackageOutcome {
   if (deferIfCapped(pass, pkg)) return 'deferred';
   pass.mutations += 1;
-  decide(pass, 'adopt', pkg.pkgDir, { key: pkg.key });
+  const replaces = isRealDir(pkg.entryDir);
+  decide(pass, 'adopt', pkg.pkgDir, {
+    key: pkg.key,
+    ...(replaces ? { detail: 'replaces an entry sealed without an install stamp' } : {}),
+  });
   if (pass.mode === 'report') {
     pass.counters.contentReads += 1;
     const contentSha256 = contentManifestSha256(pkg.nodeModulesDir, completeness.walk);
@@ -1204,6 +1355,7 @@ function adopt(
         inventory: completeness.inventory.items,
         inventorySha256: completeness.inventory.sha256,
         contentSha256,
+        stamped: installStamp !== null,
       });
     }
     pass.counters.adopted += 1;
@@ -1261,9 +1413,11 @@ function adopt(
       inventorySha256: inventory.sha256,
       inventory: inventory.items,
       contentSha256,
+      ...(installStamp ? { installStamp } : {}),
     };
     fs.writeFileSync(path.join(tmpDir, SEALED_FILE), JSON.stringify(sealed));
     fs.chmodSync(path.join(tmpDir, SEALED_FILE), 0o444);
+    if (replaces) fs.renameSync(pkg.entryDir, quarantinedPath(pkg.entryDir));
     fs.renameSync(tmpDir, pkg.entryDir);
   } catch (err) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1405,6 +1559,8 @@ function convertVerified(
     return 'converted';
   });
   if (result !== 'converted') return result;
+  // A kept per-install file is the workspace's own build output, which the entry's stamp does not vouch for.
+  if (keepOwn.every((file) => file.rel === HIDDEN_LOCKFILE)) stampCopy(pkg, pkg.nodeModulesDir, sealed);
   touchLastLinked(pass, pkg.entryDir, sealed);
   pass.counters.converted += 1;
   return 'converted';
@@ -1447,8 +1603,9 @@ export function convertPackageDir(
 }
 
 /**
- * Convert when the key has a verified entry, adopt when none. A tree sharing inodes with a quarantined entry
- * stays private and is never re-sealed. Report passes count a would-be entry as existing.
+ * Convert when the key has a verified entry, adopt when none, and re-adopt over an entry sealed without a stamp
+ * from a tree whose stamp passes the skip test. A tree sharing inodes with a quarantined entry stays private and is
+ * never re-sealed. Report passes count a would-be entry as existing.
  */
 export function processPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): PackageOutcome {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
@@ -1457,7 +1614,9 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
   if (hasPendingConversion(pkgDir)) return 'failed';
 
   const entryExists = isRealDir(pkg.entryDir);
-  const wouldBe = entryExists ? undefined : pass.wouldSeal.get(pkg.entryDir);
+  const wouldBe = pass.wouldSeal.get(pkg.entryDir);
+  // The would-be entry's source: adopt would have made it the first farm.
+  if (wouldBe?.source === pkgDir) return 'farm';
   if (entryExists) {
     const verified = verifyOnce(pass, pkg.entryDir);
     if (!verified.ok) {
@@ -1465,9 +1624,6 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
       return 'quarantined';
     }
     if (sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed)) return 'farm';
-  } else if (wouldBe?.source === pkgDir) {
-    // The would-be entry's source: adopt would have made it the first farm.
-    return 'farm';
   } else if (
     quarantinedDirsFor(pass, workgroupId, pkg.key).some((dir) => sharesEntryInodes(pkg.nodeModulesDir, dir, null))
   ) {
@@ -1484,12 +1640,18 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
     // Nothing a farm is sure to share, so no file could prove a tree is a farm.
     return 'ineligible';
   }
-  if (entryExists) {
-    const verified = verifyFresh(pass, pkg.entryDir);
-    if (!verified.ok) {
-      quarantineEntry(pass, pkg.entryDir, verified);
-      return 'quarantined';
-    }
+  const verified = entryExists ? verifyFresh(pass, pkg.entryDir) : null;
+  if (verified && !verified.ok) {
+    quarantineEntry(pass, pkg.entryDir, verified);
+    return 'quarantined';
+  }
+  const entryStamped = wouldBe
+    ? wouldBe.stamped
+    : verified !== null && parseInstallStamp(verified.sealed.installStamp) !== null;
+  const installStamp = entryStamped ? null : adoptableStamp(pkg);
+  if (installStamp) return adopt(pass, pkg, completeness, installStamp);
+  if (wouldBe) return convertVerified(pass, pkg, wouldBe, path.join(wouldBe.source, NODE_MODULES), null, completeness);
+  if (verified) {
     return convertVerified(
       pass,
       pkg,
@@ -1499,8 +1661,7 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
       completeness,
     );
   }
-  if (wouldBe) return convertVerified(pass, pkg, wouldBe, path.join(wouldBe.source, NODE_MODULES), null, completeness);
-  return adopt(pass, pkg, completeness);
+  return adopt(pass, pkg, completeness, null);
 }
 
 /** Link (§5.7.4): build `.new` from the verified entry and rename it into place. */
@@ -1542,6 +1703,7 @@ export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, p
   const result = withPackageDirTimesPreserved(pkgDir, (): LinkOutcome => {
     try {
       linkTree(path.join(pkg.entryDir, NODE_MODULES), newDir);
+      stampCopy(pkg, newDir, verified.sealed);
       fs.renameSync(newDir, pkg.nodeModulesDir);
     } catch (err) {
       fs.rmSync(newDir, { recursive: true, force: true });
