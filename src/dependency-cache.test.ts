@@ -662,24 +662,57 @@ describe('install stamps', () => {
     expect(fs.readFileSync(ownFile, 'utf8')).toBe(own.bytes);
   });
 
-  it('an entry sealed without a stamp still links and converts, but never stamps a copy', () => {
+  it('an entry sealed without a stamp is never linked or converted to', () => {
     const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
     expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
     const entry = path.join(cacheRoot, 'wg-a', keyOf(src));
     stripEntryStamp(entry);
-    expect(verifyEntry(entry).ok).toBe(true);
     const bare = path.join(tmpRoot, 'topic-b', 'repo');
     writeManifests(bare);
     const target = makeProject(path.join(tmpRoot, 'topic-c', 'repo'), { stamp: false });
+    const before = snapshotTree(target);
     const pass = startPass();
 
-    expect(linkPackageDir(pass, 'wg-a', bare)).toBe('linked');
-    expect(convertPackageDir(pass, 'wg-a', target)).toBe('converted');
+    expect(linkPackageDir(pass, 'wg-a', bare)).toBe('no-entry');
+    expect(convertPackageDir(pass, 'wg-a', target)).toBe('no-entry');
+    expect(processPackageDir(pass, 'wg-a', target)).toBe('unstamped');
 
-    expectFarmOf(bare, entry);
+    expect(fs.existsSync(path.join(bare, 'node_modules'))).toBe(false);
+    expect(snapshotTree(target)).toEqual(before);
+    expect(pass.mutations).toBe(0);
+    expect(cacheEntries('wg-a')).toEqual([keyOf(src)]);
+  });
+
+  it('a stamped tree re-adopts a key sealed without a stamp, leaving the old entry to GC and its farms their files', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    const key = keyOf(src);
+    const entry = path.join(cacheRoot, 'wg-a', key);
+    stripEntryStamp(entry);
+    const farmInodes = inodes(path.join(src, 'node_modules'));
+    const target = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    const targetStamp = readStamp(target);
+
+    expect(processPackageDir(startPass(), 'wg-a', target)).toBe('adopted');
+
+    const [, retired] = cacheEntries('wg-a');
+    expect(retired).toMatch(new RegExp(`^${key}\\.quarantined-\\d+$`));
+    expect(cacheEntries('wg-a')).toEqual([key, retired]);
+    expect(JSON.parse(fs.readFileSync(path.join(entry, 'SEALED'), 'utf8')).installStamp).toEqual(targetStamp);
+    expect(verifyEntry(entry).ok).toBe(true);
     expectFarmOf(target, entry);
-    expect(readStamp(bare)).toBeNull();
-    expect(readStamp(target)).toBeNull();
+    expectFarmOf(src, path.join(cacheRoot, 'wg-a', retired));
+
+    const bare = path.join(tmpRoot, 'topic-c', 'repo');
+    writeManifests(bare);
+    expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
+    expectFarmOf(bare, entry);
+    expect(readStamp(bare)).not.toBeNull();
+
+    collectCacheGarbage(startPass('apply', Date.now() + 8 * DAY_MS));
+
+    expect(cacheEntries('wg-a')).toEqual([key]);
+    expect(inodes(path.join(src, 'node_modules'))).toEqual(farmInodes);
   });
 });
 
