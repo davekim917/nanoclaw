@@ -550,8 +550,11 @@ async function defaultIsOwnerLive(
   ownerAgentGroupId: string | null,
   now: number,
 ): Promise<boolean> {
-  if (!claim.threadId) return false;
-  const { getDb } = await import('../../db/connection.js');
+  const [{ getDb }, { isTaskThread }] = await Promise.all([
+    import('../../db/connection.js'),
+    import('../../db/sessions.js'),
+  ]);
+  if (!claim.threadId || isTaskThread(claim.threadId)) return false;
   const row = await getDb().get<{ id: string }>(
     `SELECT s.id AS id
        FROM sessions s

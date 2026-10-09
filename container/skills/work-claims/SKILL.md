@@ -176,6 +176,8 @@ What the script enforces, so you do not have to:
 - `release` deletes only your own claim, and not while another session of yours
   holds it live from another thread (exit 3); `--merged-pr <n>` verifies the merge
   against GitHub rather than trusting your assertion.
+- `pause` and `resume` likewise refuse (exit 3) a claim another session of yours
+  holds live from another thread — the owning thread records the pause.
 - `release` and `park` both append a line to `claims/ledger.ndjson` first —
   see below.
 - No `/workspace/workgroup` → prints that the convention does not apply and exits

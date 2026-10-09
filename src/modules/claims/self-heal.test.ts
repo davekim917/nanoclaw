@@ -629,6 +629,28 @@ describe('a claim whose owning session is still working', () => {
     expect(d.sent).toEqual([]);
   });
 
+  it('still nudges a task-thread claim whose recurring series is running and posted recently', async () => {
+    await createSession({
+      id: 'sess-series',
+      agent_group_id: OWNER.agentGroupId,
+      messaging_group_id: null,
+      thread_id: 'system:tasks:dispatch-abc',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: iso(-5 * 60 * 1000),
+      created_at: iso(-30 * HOUR),
+    });
+    await getDb().run('UPDATE sessions SET last_outbound_at = ? WHERE id = ?', iso(-10 * 60 * 1000), 'sess-series');
+    const dir = root({ seam: claim(30, { thread_id: 'system:tasks:dispatch-abc' }) });
+    const d = deps(dir, { isOwnerLive: undefined });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'nudge', applied: true });
+    expect(d.sent).toHaveLength(1);
+  });
+
   it('nudges as before once the owner has gone quiet', async () => {
     await ownerSession('stopped', iso(-3 * HOUR));
     const dir = root({ seam: claim(30) });

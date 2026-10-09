@@ -204,6 +204,10 @@ cmd_take() {
     echo "REFUSED — $slug is explicitly paused by the operator. Resume only after a new explicit instruction, with --resume." >&2
     exit 3
   fi
+  if [ "$state" = "live" ] && [ "$resume" -eq 1 ]; then
+    echo "REFUSED — $slug is held live by $owner; there is no pause to resume. Have the owning thread pause it." >&2
+    exit 3
+  fi
   if [ "$state" != "paused" ] && [ "$resume" -eq 1 ]; then
     die "--resume applies only to an explicitly paused claim"
   fi
@@ -376,6 +380,12 @@ cmd_pause() {
   owner="$(jq -r '.owner // "unknown"' "$f")"
   if [ "$owner" != "$(me)" ]; then
     echo "REFUSED — $slug belongs to $owner. Only the current owner may record an operator pause." >&2
+    exit 3
+  fi
+  local state holder
+  IFS=$'\t' read -r state holder _ <<<"$(inspect "$f")"
+  if [ "$state" = "live" ]; then
+    echo "REFUSED — $slug is held live by $holder. Have the owning thread pause it." >&2
     exit 3
   fi
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"

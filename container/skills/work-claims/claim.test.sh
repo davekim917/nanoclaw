@@ -66,6 +66,19 @@ NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked from the 
 jq -e '.note == "publish-gate seam" and .thread_id == "slack:C0AAA:1786621514.008659"' \
   "$CLAIMS_DIR/acme-pr-733.json" >/dev/null || fail "refused release still wrote"
 
+# 3e. Nor may it walk around 3c through a pause: pause, resume onto its own
+#     thread, park, then point the thread back. Every step is refused.
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" pause acme-pr-733 operator hold >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours paused the claim"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" take acme-pr-733 4 --resume resuming >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours resumed the live claim"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked after resume >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours parked the claim after a pause attempt"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" thread acme-pr-733 slack:C0AAA:1786621514.008659 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours pointed the thread back"
+jq -e '.note == "publish-gate seam" and .thread_id == "slack:C0AAA:1786621514.008659" and (has("status") | not)' \
+  "$CLAIMS_DIR/acme-pr-733.json" >/dev/null || fail "refused pause walk-around still wrote"
+
 # 4. A sibling's live claim is refused with exit 3, and the file is untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 stealing it >/dev/null 2>&1 \
   && fail "took a live claim off a sibling"
