@@ -286,6 +286,20 @@ describe('buildLiveWorkDigest', () => {
     ]);
   });
 
+  it('keeps the digest, with the task claim unlinked, when that series’ inbound DB is unreadable', async () => {
+    await session('sess-dispatch', 'system:tasks:dispatch-abc');
+    fs.writeFileSync(inboundDbPath(AG, 'sess-dispatch'), 'not a sqlite database'.repeat(64));
+    claim('definitions-check', liveClaim('kit', 'system:tasks:dispatch-abc'));
+    claim('qa-env', liveClaim('kit', 'slack:CBUILD:3.000'));
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest?.claims.map((c) => [c.slug, c.link]).sort()).toEqual([
+      ['definitions-check', null],
+      ['qa-env', 'https://chat.example/slack:CBUILD:3.000'],
+    ]);
+  });
+
   it('caps the claims it carries and counts the rest as omitted', async () => {
     for (let i = 0; i < LIVE_WORK_BOUNDS.claims + 2; i++) claim(`c-${i}`, liveClaim('kit'));
 

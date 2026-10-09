@@ -178,7 +178,16 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
   const link = async (threadId: string | null) => {
     if (!threadId) return null;
     if (!isTaskThread(threadId)) return linkFor(threadId);
-    const landsIn = workgroupId ? (await resolveTaskSeries(workgroupId, threadId))?.destination?.threadId : null;
+    if (!workgroupId) return null;
+    let landsIn: string | null | undefined;
+    try {
+      landsIn = (await resolveTaskSeries(workgroupId, threadId, { inbound: { busyTimeoutMs: 0 } }))?.destination
+        ?.threadId;
+      // eslint-disable-next-line no-catch-all/no-catch-all -- a task claim's link is advisory; one unreadable session must not blank the digest
+    } catch (err) {
+      log.debug('Live work digest: task series destination unreadable, claim left unlinked', { threadId, err });
+      return null;
+    }
     return landsIn ? linkFor(landsIn) : null;
   };
 

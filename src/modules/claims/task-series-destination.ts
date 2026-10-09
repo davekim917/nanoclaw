@@ -3,7 +3,9 @@
  * messaging group, so the thread names no room a reader could follow.
  */
 import { getDb } from '../../db/connection.js';
+import { taskSeriesId } from '../../db/sessions.js';
 import { readSessionInbound } from '../mailbox/index.js';
+import type { SessionReadOptions } from '../mailbox/read-only.js';
 
 interface TaskSeriesOwner {
   sessionId: string;
@@ -23,12 +25,12 @@ interface TaskSeriesDestination {
  * The task session row is the owner. Destination, ranked: the newest `task_thread_anchors` row (where output
  * actually landed), then the series' routing stamp (where an unaddressed reply falls back to), else none.
  * `wiredOnly` skips anchors in channels the owner is not wired to, so a post sent through a destination grant
- * does not shadow a reachable room.
+ * does not shadow a reachable room. `inbound` is passed through to the routing-stamp read.
  */
 export async function resolveTaskSeries(
   workgroupId: string,
   threadId: string,
-  options: { wiredOnly?: boolean } = {},
+  options: { wiredOnly?: boolean; inbound?: SessionReadOptions } = {},
 ): Promise<{ owner: TaskSeriesOwner; destination: TaskSeriesDestination | null } | null> {
   const owner = await getDb().get<TaskSeriesOwner>(
     `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
@@ -69,13 +71,14 @@ export async function resolveTaskSeries(
     };
   }
 
+  const seriesId = taskSeriesId(threadId);
+  if (!seriesId) return { owner, destination: null };
   // Read-only: a probe must never provision or migrate the session. No mailbox
   // reads as "no routing stamp", and `--isolated` stamped none on purpose.
-  // `system:tasks:<seriesId>` — the series id is everything after the prefix.
   const stamp = readSessionInbound(
     { agentGroupId: owner.agentGroupId, sessionId: owner.sessionId },
-    (mailbox) => mailbox.getLatestTaskRoutingStamp(threadId.split(':').slice(2).join(':')),
-    { busyTimeoutMs: 5000, recoverJournal: true },
+    (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
+    options.inbound,
   );
   return { owner, destination: stamp ?? null };
 }
