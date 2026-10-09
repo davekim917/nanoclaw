@@ -562,21 +562,24 @@ describe('install stamps', () => {
     ['another arch', (dir) => writeInstallStamp(dir, { arch: 'arm64' })],
     ['another platform', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { platform: 'darwin' } })],
     ['the musl libc', (dir) => writeInstallStamp(dir, { arch: 'x64', overrides: { libc: 'musl' } })],
-  ])('never adopts a complete tree with %s', (_case, spoil) => {
-    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
-    spoil(src);
-    const before = snapshotTree(src);
+  ])(
+    'adopts a complete tree with %s as it always has, sealing no stamp and stamping no linked copy',
+    (_case, spoil) => {
+      const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+      spoil(src);
 
-    expect(processPackageDir(startPass('report'), 'wg-a', src)).toBe('unstamped');
-    const pass = startPass();
-    expect(processPackageDir(pass, 'wg-a', src)).toBe('unstamped');
+      expect(processPackageDir(startPass('report'), 'wg-a', src)).toBe('adopted');
+      expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
 
-    expect(cacheEntries('wg-a')).toEqual([]);
-    expect(snapshotTree(src)).toEqual(before);
-    expect(pass.counters.adopted).toBe(0);
-    expect(pass.mutations).toBe(0);
-    expect(decisionOps()).toContain('unstamped');
-  });
+      const entry = path.join(cacheRoot, 'wg-a', keyOf(src));
+      expect(JSON.parse(fs.readFileSync(path.join(entry, 'SEALED'), 'utf8'))).not.toHaveProperty('installStamp');
+      const bare = path.join(tmpRoot, 'topic-b', 'repo');
+      writeManifests(bare);
+      expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
+      expectFarmOf(bare, entry);
+      expect(readStamp(bare)).toBeNull();
+    },
+  );
 
   it('adopts a tree whose stamp passes the skip test, ignoring the node patch, and seals the stamp with the entry', () => {
     const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
@@ -662,24 +665,23 @@ describe('install stamps', () => {
     expect(fs.readFileSync(ownFile, 'utf8')).toBe(own.bytes);
   });
 
-  it('an entry sealed without a stamp is never linked or converted to', () => {
-    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+  it('a key no stamped tree has reached dedupes as before: links and converts to its stampless entry, writing no stamp', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), { stamp: false });
     expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
     const entry = path.join(cacheRoot, 'wg-a', keyOf(src));
-    stripEntryStamp(entry);
     const bare = path.join(tmpRoot, 'topic-b', 'repo');
     writeManifests(bare);
-    const target = makeProject(path.join(tmpRoot, 'topic-c', 'repo'), { stamp: false });
-    const before = snapshotTree(target);
-    const pass = startPass();
+    const converted = makeProject(path.join(tmpRoot, 'topic-c', 'repo'), { stamp: false });
+    const processed = makeProject(path.join(tmpRoot, 'topic-d', 'repo'), { stamp: false });
 
-    expect(linkPackageDir(pass, 'wg-a', bare)).toBe('no-entry');
-    expect(convertPackageDir(pass, 'wg-a', target)).toBe('no-entry');
-    expect(processPackageDir(pass, 'wg-a', target)).toBe('unstamped');
+    expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
+    expect(convertPackageDir(startPass(), 'wg-a', converted)).toBe('converted');
+    expect(processPackageDir(startPass(), 'wg-a', processed)).toBe('converted');
 
-    expect(fs.existsSync(path.join(bare, 'node_modules'))).toBe(false);
-    expect(snapshotTree(target)).toEqual(before);
-    expect(pass.mutations).toBe(0);
+    for (const dir of [src, bare, converted, processed]) {
+      expectFarmOf(dir, entry);
+      expect(readStamp(dir)).toBeNull();
+    }
     expect(cacheEntries('wg-a')).toEqual([keyOf(src)]);
   });
 
@@ -701,6 +703,19 @@ describe('install stamps', () => {
     expect(pass.counters.converted).toBe(1);
     expect(cacheEntries('wg-a')).toEqual([key]);
     expect(snapshotTree(second)).toEqual(before);
+  });
+
+  it('a report pass reports a stamped takeover of a key an unstamped tree would seal earlier in the same pass', () => {
+    const unstamped = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), { stamp: false });
+    const stamped = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    const later = makeProject(path.join(tmpRoot, 'topic-c', 'repo'));
+    const pass = startPass('report');
+
+    expect(processPackageDir(pass, 'wg-a', unstamped)).toBe('adopted');
+    expect(processPackageDir(pass, 'wg-a', stamped)).toBe('adopted');
+    expect(processPackageDir(pass, 'wg-a', later)).toBe('converted');
+
+    expect(cacheEntries('wg-a')).toEqual([]);
   });
 
   it('a stamped tree re-adopts a key sealed without a stamp, leaving the old entry to GC and its farms their files', () => {
@@ -728,6 +743,10 @@ describe('install stamps', () => {
     expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('linked');
     expectFarmOf(bare, entry);
     expect(readStamp(bare)).not.toBeNull();
+    const late = makeProject(path.join(tmpRoot, 'topic-d', 'repo'), { stamp: false });
+    expect(processPackageDir(startPass(), 'wg-a', late)).toBe('converted');
+    expectFarmOf(late, entry);
+    expect(readStamp(late)).not.toBeNull();
 
     collectCacheGarbage(startPass('apply', Date.now() + 8 * DAY_MS));
 

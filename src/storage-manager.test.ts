@@ -3674,6 +3674,21 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(lateReport.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 0 }));
   });
 
+  it('exempts the farm of an unstamped install from the 2-day delete', () => {
+    enableDependencyCache();
+    const { repoDir } = makeNpmTopic('thread-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2');
+    fs.rmSync(path.join(repoDir, 'node_modules', '.install-stamp.json'));
+
+    const first = sweep();
+    _resetStorageManagerThrottleForTesting();
+    const second = sweep();
+
+    expect(first.dependencyCache?.counters.adopted).toBe(1);
+    expect(first.actions).toEqual([]);
+    expect(second.actions).toEqual([]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toContain('left-pad');
+  });
+
   it('exempts a farm from the 2-day delete and sweeps the farm of a quarantined entry', () => {
     enableDependencyCache();
     const { repoDir } = makeNpmTopic('thread-b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1');

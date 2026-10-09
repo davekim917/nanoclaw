@@ -39,7 +39,6 @@ const CONTENT_CHUNK_BYTES = 1024 * 1024;
 const ENTRY_TMP_SUFFIX = '.tmp';
 const KEY_PATTERN = /^[0-9a-f]{64}$/;
 const QUARANTINED_PATTERN = /^([0-9a-f]{64})\.quarantined-(\d+)$/;
-const STAMPLESS_ENTRY_DETAIL = 'entry sealed without an install stamp';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ENTRY_GC_AGE_MS = 14 * DAY_MS;
 const QUARANTINE_GC_AGE_MS = 7 * DAY_MS;
@@ -663,6 +662,7 @@ interface EntryIdentity {
 /** What a report pass would have sealed, so later same-key trees report their convert. */
 interface WouldSealEntry extends EntryIdentity {
   source: string;
+  stamped: boolean;
 }
 
 export type VerifyResult =
@@ -1034,16 +1034,6 @@ function linkTree(src: string, dst: string): void {
   }
 }
 
-/**
- * An entry sealed without an install stamp is never linked or converted to, so a stamped tree of its key
- * re-adopts it; farms already linked to it keep their files.
- */
-function refuseStamplessEntry(pass: DependencyCachePass, pkg: PreparedPackage, sealed: SealedRecord): boolean {
-  if (parseInstallStamp(sealed.installStamp)) return false;
-  decide(pass, 'unstamped', pkg.pkgDir, { key: pkg.key, detail: STAMPLESS_ENTRY_DETAIL });
-  return true;
-}
-
 function adoptableStamp(pkg: PreparedPackage): InstallStamp | null {
   const stamp = parseInstallStamp(readJsonObject(path.join(pkg.nodeModulesDir, INSTALL_STAMP_NAME)));
   const fields = stampPackageFields(pkg.pkgDir, pkg.inputs);
@@ -1139,7 +1129,6 @@ export type PackageOutcome =
   | 'quarantined'
   | 'no-entry'
   | 'deferred'
-  | 'unstamped'
   | 'failed';
 
 export type LinkOutcome =
@@ -1339,23 +1328,23 @@ function deferIfCapped(pass: DependencyCachePass, pkg: PreparedPackage): boolean
 }
 
 /**
- * Adopt (§5.7.4): link into `<key>.tmp/node_modules`, `chmod a-w`, write SEALED with the source's install stamp,
- * rename to `<key>`. The source becomes the entry's first farm. A report pass records what it would seal, so later
- * same-key trees report a convert, not a second adopt. An entry already at `<key>` (one sealed without a stamp) is
- * renamed to a quarantined name for GC.
+ * Adopt (§5.7.4): link into `<key>.tmp/node_modules`, `chmod a-w`, write SEALED with the source's install stamp
+ * when it has one, rename to `<key>`. The source becomes the entry's first farm. A report pass records what it would
+ * seal, so later same-key trees report a convert, not a second adopt. An entry already at `<key>` (one sealed without
+ * a stamp, replaced by a stamped tree) is renamed to a quarantined name for GC.
  */
 function adopt(
   pass: DependencyCachePass,
   pkg: PreparedPackage,
   completeness: { walk: TreeWalk; inventory: Inventory },
-  installStamp: InstallStamp,
+  installStamp: InstallStamp | null,
 ): PackageOutcome {
   if (deferIfCapped(pass, pkg)) return 'deferred';
   pass.mutations += 1;
   const replaces = isRealDir(pkg.entryDir);
   decide(pass, 'adopt', pkg.pkgDir, {
     key: pkg.key,
-    ...(replaces ? { detail: `replaces an ${STAMPLESS_ENTRY_DETAIL}` } : {}),
+    ...(replaces ? { detail: 'replaces an entry sealed without an install stamp' } : {}),
   });
   if (pass.mode === 'report') {
     pass.counters.contentReads += 1;
@@ -1366,6 +1355,7 @@ function adopt(
         inventory: completeness.inventory.items,
         inventorySha256: completeness.inventory.sha256,
         contentSha256,
+        stamped: installStamp !== null,
       });
     }
     pass.counters.adopted += 1;
@@ -1423,7 +1413,7 @@ function adopt(
       inventorySha256: inventory.sha256,
       inventory: inventory.items,
       contentSha256,
-      installStamp,
+      ...(installStamp ? { installStamp } : {}),
     };
     fs.writeFileSync(path.join(tmpDir, SEALED_FILE), JSON.stringify(sealed));
     fs.chmodSync(path.join(tmpDir, SEALED_FILE), 0o444);
@@ -1596,7 +1586,6 @@ export function convertPackageDir(
     return 'quarantined';
   }
   if (sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed)) return 'farm';
-  if (refuseStamplessEntry(pass, pkg, verified.sealed)) return 'no-entry';
   const completeness = checkCompleteness(pkgDir);
   if (!completeness.complete) {
     decide(pass, 'incomplete', pkgDir, { key: pkg.key, detail: completeness.reason });
@@ -1614,8 +1603,9 @@ export function convertPackageDir(
 }
 
 /**
- * Convert when the key has a verified entry, adopt when none. A tree sharing inodes with a quarantined entry
- * stays private and is never re-sealed. Report passes count a would-be entry as existing.
+ * Convert when the key has a verified entry, adopt when none, and re-adopt over an entry sealed without a stamp
+ * from a tree whose stamp passes the skip test. A tree sharing inodes with a quarantined entry stays private and is
+ * never re-sealed. Report passes count a would-be entry as existing.
  */
 export function processPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): PackageOutcome {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
@@ -1650,31 +1640,28 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
     // Nothing a farm is sure to share, so no file could prove a tree is a farm.
     return 'ineligible';
   }
-  if (entryExists) {
-    const verified = verifyFresh(pass, pkg.entryDir);
-    if (!verified.ok) {
-      quarantineEntry(pass, pkg.entryDir, verified);
-      return 'quarantined';
-    }
-    if (parseInstallStamp(verified.sealed.installStamp)) {
-      return convertVerified(
-        pass,
-        pkg,
-        verified.sealed,
-        path.join(pkg.entryDir, NODE_MODULES),
-        verified.sealed,
-        completeness,
-      );
-    }
+  const verified = entryExists ? verifyFresh(pass, pkg.entryDir) : null;
+  if (verified && !verified.ok) {
+    quarantineEntry(pass, pkg.entryDir, verified);
+    return 'quarantined';
   }
+  const entryStamped = wouldBe
+    ? wouldBe.stamped
+    : verified !== null && parseInstallStamp(verified.sealed.installStamp) !== null;
+  const installStamp = entryStamped ? null : adoptableStamp(pkg);
+  if (installStamp) return adopt(pass, pkg, completeness, installStamp);
   if (wouldBe) return convertVerified(pass, pkg, wouldBe, path.join(wouldBe.source, NODE_MODULES), null, completeness);
-  const installStamp = adoptableStamp(pkg);
-  if (!installStamp) {
-    // An entry is linked into checkouts that never installed it, so it must be a tree whose lifecycle scripts ran.
-    decide(pass, 'unstamped', pkgDir, { key: pkg.key, detail: `no ${INSTALL_STAMP_NAME} matching this tree` });
-    return 'unstamped';
+  if (verified) {
+    return convertVerified(
+      pass,
+      pkg,
+      verified.sealed,
+      path.join(pkg.entryDir, NODE_MODULES),
+      verified.sealed,
+      completeness,
+    );
   }
-  return adopt(pass, pkg, completeness, installStamp);
+  return adopt(pass, pkg, completeness, null);
 }
 
 /** Link (§5.7.4): build `.new` from the verified entry and rename it into place. */
@@ -1695,7 +1682,6 @@ export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, p
     quarantineEntry(pass, pkg.entryDir, verified);
     return 'quarantined';
   }
-  if (refuseStamplessEntry(pass, pkg, verified.sealed)) return 'no-entry';
   // A link hands this workspace content it never installed, so the entry must
   // also hold every optional package npm would install here (§5.7.5).
   const strict = checkLinkCompleteness(pkgDir, path.join(pkg.entryDir, NODE_MODULES));
