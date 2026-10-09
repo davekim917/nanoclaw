@@ -84,9 +84,10 @@ you are in:
   `secret_url`: it opens the OneCLI dashboard on the host, which the user
   usually cannot reach from chat, and it is not the secure form.
 - **`access_restricted`** (body has a `manage_url`): the key exists but this
-  agent is not granted it. Run `ncl secrets grant --name <vault name>`,
-  which waits for an admin's approval; the grant reaches you at your next
-  container start. Never show the `manage_url`.
+  agent is not granted it. Run `ncl secrets grant --name <vault name>
+  --groups <your agent group id>` (the vault name from the error, else ask
+  the user), which waits for an admin's approval; the grant reaches you at
+  your next container start. Never show the `manage_url`.
 - **`app_not_connected`** (body has a `connect_url`): an OAuth app (Gmail,
   GitHub, Google Calendar, ...) is not connected. Show the `connect_url` as
   a bare URL on its own line — no angle brackets, no markdown link syntax —
@@ -136,5 +137,5 @@ use or repeat it; tell them to rotate it, since chat history keeps it.
 - **Never** suggest the user open Gmail/Calendar/GitHub in their browser
   when they ask you to read or interact with those services. You have API
   access. Use it.
-- If the gateway returns a policy error (403 with a JSON body), respect
-  the block. Do not retry or circumvent it.
+- A 403 whose error is none of the three codes in When a Request Fails is
+  a policy block: respect it. Do not retry or circumvent it.

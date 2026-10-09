@@ -94,6 +94,7 @@ describe('onecli-gateway/instructions.md content merged into SKILL.md', () => {
     const frontmatter = raw.split('---')[1] ?? '';
     expect(frontmatter).toContain('credential_not_found');
     expect(frontmatter).toContain('ncl secrets intake');
+    expect(frontmatter).toMatch(/never show the user a secret_url/i);
   });
 
   it('SKILL.md body still carries the bare-URL display rule', () => {
