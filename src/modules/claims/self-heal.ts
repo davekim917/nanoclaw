@@ -197,7 +197,7 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: 
     `MOVE the claim before this task ends, unless option 4 applies:\n` +
     `1. Finish the work, then \`${claimSh} release ${claim.slug}\`.\n` +
     `2. Stopping without finishing: \`${claimSh} park ${claim.slug} "<what a successor needs to know>"\`. ` +
-    `Dead or superseded: \`${claimSh} release ${claim.slug}\`.\n` +
+    `Dead or superseded, and no other session is still working it: \`${claimSh} release ${claim.slug}\`.\n` +
     `3. SOMEONE ELSE — a human or another agent — owes you a decision or an action you cannot proceed without: ` +
     `\`${claimSh} park ${claim.slug} "waiting on <person-or-agent>: <what you asked>"\`, AND post ONE message that ` +
     `@-mentions whoever owes it. The mention is what delivers the ask — a notification to a human, a wake to an agent; ` +

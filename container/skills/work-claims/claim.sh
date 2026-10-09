@@ -256,26 +256,27 @@ cmd_release() {
   done
 
   require_workgroup
-  local f owner note claimed_at thread_id
+  local f owner note claimed_at thread_id state holder
   f="$(file_for "$slug")"
   [ -f "$f" ] || { echo "no claim at $slug — nothing to release"; exit 0; }
   owner="$(jq -r '.owner // "unknown"' "$f")"
   note="$(jq -r '.note // ""' "$f")"
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
   thread_id="$(jq -r '.thread_id // empty' "$f")"
+  IFS=$'\t' read -r state holder _ <<<"$(inspect "$f")"
 
-  if [ "$owner" != "$(me)" ]; then
+  if [ "$owner" != "$(me)" ] || [ "$state" = "live" ]; then
     [ -n "$merged_pr" ] || {
-      echo "REFUSED — $slug belongs to $owner. Release only your own claim." >&2
+      echo "REFUSED — $slug belongs to $holder. Release only your own claim." >&2
       echo "If its PR has MERGED, re-run with --merged-pr <n> and the merge is verified here." >&2
       exit 3
     }
     # The skill's one exception. Verified against GitHub, never inferred from a
     # stale timestamp and never taken on the caller's assertion.
-    local state
-    state="$(gh pr view "$merged_pr" --json state -q .state 2>/dev/null || echo UNKNOWN)"
-    [ "$state" = "MERGED" ] || {
-      echo "REFUSED — PR #$merged_pr is $state, not MERGED. Leave $owner's claim alone and escalate." >&2
+    local pr_state
+    pr_state="$(gh pr view "$merged_pr" --json state -q .state 2>/dev/null || echo UNKNOWN)"
+    [ "$pr_state" = "MERGED" ] || {
+      echo "REFUSED — PR #$merged_pr is $pr_state, not MERGED. Leave $owner's claim alone and escalate." >&2
       exit 3
     }
     echo "PR #$merged_pr verified MERGED — clearing $owner's completed claim"

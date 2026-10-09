@@ -59,6 +59,13 @@ NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked from the 
   && fail "another session of yours parked the claim"
 [ "$(jq -r '.status // "live"' "$CLAIMS_DIR/acme-pr-733.json")" = live ] || fail "refused park still wrote"
 
+# 3d. Nor may it release the claim: deleting another session's live work is the
+#     same failure as parking it.
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" release acme-pr-733 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours released the claim"
+jq -e '.note == "publish-gate seam" and .thread_id == "slack:C0AAA:1786621514.008659"' \
+  "$CLAIMS_DIR/acme-pr-733.json" >/dev/null || fail "refused release still wrote"
+
 # 4. A sibling's live claim is refused with exit 3, and the file is untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 stealing it >/dev/null 2>&1 \
   && fail "took a live claim off a sibling"

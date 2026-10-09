@@ -173,7 +173,8 @@ What the script enforces, so you do not have to:
 - `park` REFUSES another agent's live claim (exit 3, same as `take`) and another
   agent's stale claim ("take it over first, then park") — you can only park your
   own claim, or an unclaimed slug (advertising work that needs an owner).
-- `release` deletes only your own claim, and `--merged-pr <n>` verifies the merge
+- `release` deletes only your own claim, and not while another session of yours
+  holds it live from another thread (exit 3); `--merged-pr <n>` verifies the merge
   against GitHub rather than trusting your assertion.
 - `release` and `park` both append a line to `claims/ledger.ndjson` first —
   see below.
