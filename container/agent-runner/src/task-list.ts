@@ -25,8 +25,8 @@ export const TASK_LIST_REPOST_AFTER_MS = 15 * 60 * 1000;
 const TASK_LIST_REPOST_MIN_MESSAGES = 2;
 /**
  * Discord caps edits to a message older than 1 hour (API error 30046), so a
- * Discord list is reposted before then — while its old copy can still be
- * edited into a pointer.
+ * Discord list is reposted before then: the live list must stay editable, and
+ * the host's fallback edit of the old copy must still land.
  */
 export const TASK_LIST_DISCORD_REPOST_AFTER_MS = 50 * 60 * 1000;
 
@@ -53,7 +53,7 @@ export interface TaskListState {
   postSeq: number | null;
   /** Highest inbound seq when the post was written — the repost check's inbound cursor. */
   postInboundSeq?: number | null;
-  /** The list this post replaces on screen; collapsed into a pointer only once this post has a platform id (until then it IS the visible list). */
+  /** The list this post replaces on screen; retired only once this post has a platform id (until then it IS the visible list). */
   supersedes?: { outboundId: string; platformMessageId: string } | null;
   /** Platform id of the visible post, once the host has delivered it. */
   platformMessageId: string | null;
@@ -197,25 +197,6 @@ function activeText(items: TaskItem[]): string | null {
   return active ? active.text : null;
 }
 
-/** Slack only, and only with real Slack ids: a link that 404s is worse than plain text. */
-export function latestListLink(
-  channelType: string,
-  platformId: string,
-  threadId: string | null,
-  platformMessageId: string | null,
-): string | null {
-  if (!channelType.startsWith('slack') || !platformMessageId) return null;
-  const channel = platformId.split(':').pop();
-  const threadTs = threadId ? threadId.split(':').pop() : null;
-  if (!channel || !/^[A-Z0-9]+$/.test(channel) || !/^\d+\.\d+$/.test(platformMessageId)) return null;
-  const query = threadTs && /^\d+\.\d+$/.test(threadTs) ? `?thread_ts=${threadTs}&cid=${channel}` : '';
-  return `https://slack.com/archives/${channel}/p${platformMessageId.replace('.', '')}${query}`;
-}
-
-function supersededText(link: string | null): string {
-  return link ? `[Latest task list →](${link})` : 'Latest task list ↓';
-}
-
 /** Parse the stored record; anything malformed reads as "no list". */
 export function parseTaskListState(raw: string | undefined): TaskListState | null {
   if (!raw) return null;
@@ -276,12 +257,8 @@ export async function applyTaskListUpdate(
   const finished = input.items.every((item) => item.status === 'done');
   const text = renderBody(input.title, input.items);
   const subtext = renderSubtext(routing.channelType, now);
-  const collapse = async (messageId: string, latest: string): Promise<void> => {
-    const link = latestListLink(routing.channelType, routing.platformId, routing.threadId, latest);
-    await deps.write(
-      { operation: 'edit', messageId, text: supersededText(link), taskList: { superseded: true } },
-      routing,
-    );
+  const retire = async (messageId: string): Promise<void> => {
+    await deps.write({ operation: 'delete', messageId }, routing);
   };
 
   // A post the host reported as failed is no post at all: start over.
@@ -301,7 +278,7 @@ export async function applyTaskListUpdate(
       return { ok: false, error: 'the task list post has not been delivered yet; call update_task_list again shortly' };
     }
     if (current && target && current.supersedes) {
-      await collapse(current.supersedes.platformMessageId, target);
+      await retire(current.supersedes.platformMessageId);
       current = { ...current, supersedes: null };
     }
   }
@@ -324,7 +301,7 @@ export async function applyTaskListUpdate(
     target = prev.platformMessageId;
     reused = true;
     if (prev.supersedes) {
-      await collapse(prev.supersedes.platformMessageId, target);
+      await retire(prev.supersedes.platformMessageId);
       current = { ...prev, supersedes: null };
     }
   }
@@ -400,9 +377,8 @@ export async function applyTaskListUpdate(
   const ack = await deps.awaitPlatformId(post.id, POST_ACK_TIMEOUT_MS);
   if (ack.platformId) {
     next.platformMessageId = ack.platformId;
-    // Collapse only once the replacement is on screen (a failed post passes `supersedes` on). Best effort.
     if (replaced) {
-      await collapse(replaced.platformMessageId, ack.platformId);
+      await retire(replaced.platformMessageId);
       next.supersedes = null;
     }
     save(next);

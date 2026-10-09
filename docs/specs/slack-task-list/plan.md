@@ -13,7 +13,8 @@ Status: approved 2026-09-24 by the operator, built in PR 1
 4. **Follow-ups mid-run join the live list** (ack reaction on the follow-up, new `○` item).
 5. **Results post as separate messages** below; the list references them ("Findings posted below").
 6. **One live list per thread**: a new list, or a repost in a busy thread (≥15 min since last post),
-   edits the old list down to "Latest task list →" (permalink).
+   deletes the old list (where the platform cannot delete it, the old post is edited to the plain text
+   "Latest task list below ↓", with no link).
 7. **Edits are silent** in Slack (no notification) → anything the user must see (blocker, approval needed,
    done) posts as a new message; `@user` only when they must act.
 8. **No 💭 thinking messages.** The list + status line replace them.
@@ -193,8 +194,8 @@ something the plan did not know.
   "is thinking…", or "is working: <current item>" once the list has one.
 - **Agent-shared sessions** have no conversation of their own, so the tool refuses there and they keep their 💭
   progress.
-- **Replacing a list**: a repost's old copy (or the previous generation) is collapsed into a pointer only once the
-  new post has a platform id. Until then it stays the visible list, and a kill marks IT interrupted.
+- **Replacing a list**: a repost's old copy (or the previous generation) is deleted only once the new post has a
+  platform id; if the delete is unavailable or fails, the host edits it to the plain stub instead. Until then it stays the visible list, and a kill marks IT interrupted.
 - **Crashes**: a container exit the host did not ask for (OOM, runner crash, adopted or spawned) settles its list
   like a kill; the host tracks its own stops by container name so a stop settles once. Exit codes are not read: an
   adopted container's `docker wait` exits 0 whatever the container did.
@@ -203,7 +204,7 @@ something the plan did not know.
 - **Channel-level sessions** (Discord channels, shared-mode Slack): the list is never the turn's thread anchor (the
   answer stays the root) and goes in the thread of the message being answered.
 - **Discord**: a list is reposted once its post is 50 min old (Discord caps edits to messages older than 1 h,
-  API error 30046), while the old copy can still be edited into a pointer.
+  API error 30046), so the live list stays editable and the stub fallback can still land on the old copy.
 - **When a list is used** (PR 2): the model decides. A live test showed the tool description alone did not get
   lists used unprompted (0 of 3 providers on a real multi-step audit), so the rule also ships always-on as
   `mcp-tools/task-list.instructions.md` — composed into every provider's CLAUDE.md/AGENTS.md, omitted when the

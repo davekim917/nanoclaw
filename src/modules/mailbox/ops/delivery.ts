@@ -61,17 +61,19 @@ export function markDelivered(
   messageOutId: string,
   platformMessageId: string | null,
   notice?: string,
+  taskListRoute?: string,
 ): void {
   db.prepare(
-    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at, notice)
-     VALUES (?, ?, 'delivered', ?, ?)
+    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at, notice, task_list_route)
+     VALUES (?, ?, 'delivered', ?, ?, ?)
      ON CONFLICT(message_out_id) DO UPDATE SET
        platform_message_id = excluded.platform_message_id,
        status = 'delivered',
        error = NULL,
        delivered_at = excluded.delivered_at,
-       notice = COALESCE(excluded.notice, delivered.notice)`,
-  ).run(messageOutId, platformMessageId ?? null, new Date().toISOString(), notice ?? null);
+       notice = COALESCE(excluded.notice, delivered.notice),
+       task_list_route = COALESCE(excluded.task_list_route, delivered.task_list_route)`,
+  ).run(messageOutId, platformMessageId ?? null, new Date().toISOString(), notice ?? null, taskListRoute ?? null);
 }
 
 export function markDeliveryFailed(db: Database.Database, messageOutId: string, errorMessage?: string): void {

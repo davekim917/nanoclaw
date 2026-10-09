@@ -61,8 +61,10 @@ import {
   deferTaskListOnRateLimit,
   noteHeldTaskListPost,
   noteTaskListDelivered,
+  retireSupersededTaskList,
   supersededTaskListEdits,
   taskListCooldownMs,
+  taskListPostReceipt,
 } from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
@@ -886,7 +888,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // silently unblock a gated command.
       if (!result.deferAck) {
         await ackDelivery(agentGroup.id, session.id, (mailbox) => {
-          mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.notice);
+          mailbox.markDelivered(msg.id, result.platformMsgId ?? null, result.notice, result.taskListRoute);
           if (msg.kind === 'chat' && !result.recordOnly)
             for (const id of heldListPosts) mailbox.markDelivered(id, null);
         });
@@ -1080,7 +1082,14 @@ async function deliverMessage(
     timestamp?: string;
   },
   session: Session,
-): Promise<{ platformMsgId?: string; deferAck?: true; recordOnly?: true; notice?: string; routePending?: true }> {
+): Promise<{
+  platformMsgId?: string;
+  deferAck?: true;
+  recordOnly?: true;
+  notice?: string;
+  routePending?: true;
+  taskListRoute?: string;
+}> {
   if (msg.kind === 'work_log') return { recordOnly: true };
   if (await recordGateRow(msg, session)) return { recordOnly: true };
   assertChannelRoutingConsistency({ channelType: msg.channel_type, platformId: msg.platform_id });
@@ -1282,6 +1291,8 @@ async function deliverMessage(
     deliverInstance = mg.instance;
     deliverMessagingGroupId = mg.id;
   }
+  if (msg.kind === 'task_list' && content.operation === 'delete')
+    return retireSupersededTaskList(deliveryAdapter, session, msg, deliverInstance);
 
   // Status: the first in a turn posts, later ones edit in place; a real chat message clears the tracking.
   if (msg.kind === 'status') {
@@ -1894,7 +1905,11 @@ async function deliverMessage(
           splitThreadKey: routeVeto.splitAddr?.threadKey,
         })
       : undefined;
-  return { platformMsgId: platformMsgId ?? undefined, ...(notice ? { notice } : {}) };
+  return {
+    platformMsgId: platformMsgId ?? undefined,
+    ...(notice ? { notice } : {}),
+    ...taskListPostReceipt(msg.kind, content, msg.channel_type, msg.platform_id, effectiveThreadId, deliverInstance),
+  };
 }
 
 /**

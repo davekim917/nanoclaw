@@ -82,6 +82,8 @@ import {
   getRecoverableLifecycleStatus,
   getNextScheduledWakeAt,
   getTaskListSettlement,
+  getTaskListPostRoute,
+  type TaskListPostRoute,
   type TaskListSettlement,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
@@ -300,7 +302,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** Fence-aware: epoch-tagged rows are inert and never counted. */
   countDueMessages(): number;
   /** UPSERT over an earlier 'pending'/'failed' row; clears `error` and sets `notice` (null when absent). */
-  markDelivered(messageOutId: string, platformMessageId: string | null, notice?: string): void;
+  markDelivered(messageOutId: string, platformMessageId: string | null, notice?: string, taskListRoute?: string): void;
   /** UPSERT that records the adapter's error message. */
   markDeliveryFailed(messageOutId: string, errorMessage?: string): void;
   /** Preserve the delivery receipt while marking its activity line terminal. */
@@ -356,6 +358,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** When the earliest `wait` the agent armed comes due, if it has not yet (see the op). */
   getNextScheduledWakeAt(): string | null;
   getTaskListSettlement(killedAt: string): TaskListSettlement | null;
+  getTaskListPostRoute(platformMessageId: string): TaskListPostRoute | null;
 
   /**
    * False for never-woken sessions. Outbound READS already degrade to empty,
@@ -821,8 +824,8 @@ function forkOps(
         thread_id: routing.threadId,
       }),
     countDueMessages: () => countDueMessages(inbound),
-    markDelivered: (messageOutId, platformMessageId, notice) =>
-      markDelivered(inbound, messageOutId, platformMessageId, notice),
+    markDelivered: (messageOutId, platformMessageId, notice, taskListRoute) =>
+      markDelivered(inbound, messageOutId, platformMessageId, notice, taskListRoute),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
     markLifecycleTerminal: (messageOutId) => markLifecycleTerminal(inbound, messageOutId),
     insertMessage: async (message) => {
@@ -886,6 +889,7 @@ function forkOps(
     getNextScheduledWakeAt: () => getNextScheduledWakeAt(inbound),
     getTaskListSettlement: (killedAt) =>
       readOutbound(null, (outbound) => getTaskListSettlement(inbound, outbound, killedAt)),
+    getTaskListPostRoute: (platformMessageId) => getTaskListPostRoute(inbound, platformMessageId),
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),

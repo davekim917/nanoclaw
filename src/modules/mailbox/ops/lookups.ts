@@ -234,6 +234,38 @@ export interface TaskListSettlement {
   } | null;
 }
 
+export interface TaskListPostRoute {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  instance: string | null;
+}
+
+/** A container-written row is no proof: the container can rewrite its own outbound rows after delivery. */
+export function getTaskListPostRoute(inbound: Database.Database, platformMessageId: string): TaskListPostRoute | null {
+  const row = inbound
+    .prepare(
+      `SELECT task_list_route FROM delivered
+        WHERE platform_message_id = ? AND status = 'delivered' AND task_list_route IS NOT NULL
+        ORDER BY julianday(delivered_at) DESC
+        LIMIT 1`,
+    )
+    .get(platformMessageId) as { task_list_route: string } | undefined;
+  if (!row) return null;
+  try {
+    const route = JSON.parse(row.task_list_route) as Partial<TaskListPostRoute>;
+    if (typeof route.channelType !== 'string' || typeof route.platformId !== 'string') return null;
+    return {
+      channelType: route.channelType,
+      platformId: route.platformId,
+      threadId: typeof route.threadId === 'string' ? route.threadId : null,
+      instance: typeof route.instance === 'string' ? route.instance : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export const SCHEDULE_WAKE_ID_PREFIX = 'schedule-wake-';
 export const SCHEDULE_WAKE_SYSTEM_KIND = 'agent_scheduled_wake';
 

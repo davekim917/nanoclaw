@@ -29,6 +29,7 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getDb,
   initMigratedTestDb,
 } from './db/index.js';
 import { resolveGroupTimezone } from './container-config.js';
@@ -688,6 +689,174 @@ describe('task list delivery (switch on)', () => {
     expect(calls.map((c) => c.content.text)).toEqual(['three']);
     const done = await delivered(sessionId);
     expect(['edit-0', 'edit-1', 'edit-2'].every((id) => done.has(id))).toBe(true);
+  });
+
+  describe('a superseded list post', () => {
+    type Deleted = { channelType: string; platformId: string; threadId: string | null; messageId: string };
+    const STUB = { operation: 'edit', messageId: 'plat-1', text: 'Latest task list below ↓' };
+    function deletingAdapter(deleteImpl?: () => Promise<void>): { calls: Call[]; deleted: Deleted[] } {
+      const calls: Call[] = [];
+      const deleted: Deleted[] = [];
+      setDeliveryAdapter({
+        async deliver(_channelType, _platformId, threadId, kind, content) {
+          calls.push({ kind, threadId, content: JSON.parse(content) as Record<string, unknown> });
+          return `plat-${calls.length}`;
+        },
+        async deleteMessage(channelType, platformId, threadId, messageId) {
+          deleted.push({ channelType, platformId, threadId, messageId });
+          await deleteImpl?.();
+        },
+      });
+      return { calls, deleted };
+    }
+    async function postList(sessionId: string) {
+      insertRow(
+        sessionId,
+        'list-1',
+        'task_list',
+        { text: 'T\n✱ A' },
+        { timestamp: new Date(Date.now() - 1000).toISOString() },
+      );
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      return session;
+    }
+    const retire = (
+      sessionId: string,
+      id = 'retire-1',
+      messageId = 'plat-1',
+      route: { platformId?: string; threadId?: string | null } = {},
+    ) => insertRow(sessionId, id, 'task_list', { operation: 'delete', messageId }, route);
+
+    it('is deleted on the route the host delivered it on, with no edit', async () => {
+      const sessionId = await seed();
+      const { calls, deleted } = deletingAdapter();
+      const session = await postList(sessionId);
+      retire(sessionId, 'retire-1', 'plat-1', { threadId: 'slack:C0AAA:1786621514.999999' });
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([{ channelType: 'slack', platformId: PLATFORM, threadId: THREAD, messageId: 'plat-1' }]);
+      expect(calls.map((c) => c.content.operation)).toEqual([undefined]);
+      expect(await delivered(sessionId)).toContain('retire-1');
+    });
+
+    it('is edited to the plain stub, with no link, when the delete fails', async () => {
+      const sessionId = await seed();
+      const warn = vi.spyOn(log, 'warn');
+      const { calls, deleted } = deletingAdapter(async () => {
+        throw new Error('slack cant_delete_message');
+      });
+      const session = await postList(sessionId);
+      retire(sessionId);
+      await deliverSessionMessages(session);
+      expect(deleted).toHaveLength(1);
+      expect(calls.slice(1)).toEqual([{ kind: 'task_list', threadId: THREAD, content: STUB }]);
+      expect(warn).toHaveBeenCalledWith(
+        'Failed to delete a superseded task list — editing it to a stub',
+        expect.objectContaining({ messageId: 'plat-1' }),
+      );
+      expect(await delivered(sessionId)).toContain('retire-1');
+      warn.mockRestore();
+    });
+
+    it('is edited to the plain stub when the adapter cannot delete', async () => {
+      const sessionId = await seed();
+      const calls = captureAdapter();
+      const session = await postList(sessionId);
+      retire(sessionId);
+      await deliverSessionMessages(session);
+      expect(calls.slice(1).map((c) => c.content)).toEqual([STUB]);
+    });
+
+    it('never deletes or edits a message the host did not deliver as a list post', async () => {
+      const sessionId = await seed();
+      const { calls, deleted } = deletingAdapter();
+      insertRow(sessionId, 'answer', 'chat', { text: 'An answer' });
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(calls).toHaveLength(1);
+      const db = outbound(sessionId);
+      db.prepare("UPDATE messages_out SET kind = 'task_list', content = ? WHERE id = 'answer'").run(
+        JSON.stringify({ text: 'T' }),
+      );
+      db.close();
+      retire(sessionId, 'forged-answer', 'plat-1');
+      retire(sessionId, 'forged-unknown', '1786621699.000999');
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([]);
+      expect(calls).toHaveLength(1);
+      const done = await delivered(sessionId);
+      expect(done).toContain('forged-answer');
+      expect(done).toContain('forged-unknown');
+    });
+
+    it('is neither deleted nor edited once the session may no longer send where it was posted', async () => {
+      const sessionId = await seed();
+      const OTHER = 'slack:C0BBB';
+      await createMessagingGroup({
+        id: 'mg-2',
+        channel_type: 'slack',
+        platform_id: OTHER,
+        name: 'Other',
+        is_group: 1,
+        unknown_sender_policy: 'public',
+        created_at: now(),
+      });
+      await getDb().run(
+        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+         VALUES ('ag-1', 'other', 'channel', 'mg-2', ?)`,
+        now(),
+      );
+      const { calls, deleted } = deletingAdapter();
+      insertRow(sessionId, 'list-other', 'task_list', { text: 'T' }, { platformId: OTHER, threadId: null });
+      const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+      await deliverSessionMessages(session);
+      expect(calls).toHaveLength(1);
+      await getDb().run(`DELETE FROM agent_destinations WHERE agent_group_id = 'ag-1' AND target_id = 'mg-2'`);
+      retire(sessionId, 'retire-other', 'plat-1', { platformId: OTHER, threadId: null });
+      retire(sessionId, 'retire-origin', 'plat-1');
+      for (let i = 0; i < 3; i++) await deliverSessionMessages(session);
+      expect(deleted).toEqual([]);
+      expect(calls).toHaveLength(1);
+    });
+
+    it('is neither deleted nor edited through an adapter instance other than the one it was posted by', async () => {
+      const sessionId = await seed();
+      const { calls, deleted } = deletingAdapter();
+      const session = await postList(sessionId);
+      await getDb().run(`UPDATE messaging_groups SET instance = 'slack-sibling' WHERE id = 'mg-1'`);
+      retire(sessionId);
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([]);
+      expect(calls).toHaveLength(1);
+      expect(await delivered(sessionId)).toContain('retire-1');
+    });
+
+    it('waits out a rate-limited delete, even past an answer, and never falls back to the stub', async () => {
+      const sessionId = await seed();
+      let limited = true;
+      const { calls, deleted } = deletingAdapter(async () => {
+        if (limited) throw new Error('slack rate_limited: Retry-After: 1');
+      });
+      const session = await postList(sessionId);
+      const base = Date.now();
+      insertRow(
+        sessionId,
+        'retire-1',
+        'task_list',
+        { operation: 'delete', messageId: 'plat-1' },
+        { timestamp: new Date(base).toISOString() },
+      );
+      insertRow(sessionId, 'answer', 'chat', { text: 'Done.' }, { timestamp: new Date(base + 1).toISOString() });
+      await deliverSessionMessages(session);
+      expect(calls.map((c) => c.kind)).toEqual(['task_list', 'chat']);
+      expect(await delivered(sessionId)).not.toContain('retire-1');
+      limited = false;
+      await new Promise((r) => setTimeout(r, 1_100));
+      await deliverSessionMessages(session);
+      expect(deleted).toHaveLength(2);
+      expect(calls.map((c) => c.kind)).toEqual(['task_list', 'chat']);
+      expect(await delivered(sessionId)).toContain('retire-1');
+    });
   });
 
   it('shows the scrubbed item in the status line, never a registered secret', async () => {
