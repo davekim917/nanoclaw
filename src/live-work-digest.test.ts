@@ -140,17 +140,8 @@ describe('buildLiveWorkDigest', () => {
 
     const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
 
+    // A scheduled-task session cannot keep a task list, so a list left on one is never live work.
     expect(digest?.sessions).toEqual([
-      {
-        owner: 'Live',
-        self: true,
-        channel: 'scheduled task',
-        threadId: 'system:tasks:nightly',
-        link: null,
-        title: 'Nightly sweep',
-        items: ['○ Sweep'],
-        updatedAt: at(-60 * 1000),
-      },
       {
         owner: 'Live',
         self: true,
@@ -215,8 +206,8 @@ describe('buildLiveWorkDigest', () => {
     ]);
   });
 
-  it('marks the snapshot partial when the candidate scan hits its cap', async () => {
-    for (let i = 0; i < LIVE_WORK_BOUNDS.candidateSessions; i++) {
+  it('finds an older open list behind more recent scheduled-task sessions than the scan cap, and is not partial', async () => {
+    for (let i = 0; i < LIVE_WORK_BOUNDS.openListSessions + 5; i++) {
       await createSession({
         id: `sess-quiet-${i}`,
         agent_group_id: AG,
@@ -232,12 +223,46 @@ describe('buildLiveWorkDigest', () => {
     await session('sess-long-build', 'slack:CBUILD:2.000', {
       title: 'Long build',
       items: [{ text: 'Provision QA', status: 'in_progress' }],
-      touchedAt: at(0),
+      touchedAt: at(-20 * HOUR),
     });
+    await getDb().run('UPDATE sessions SET last_active = ? WHERE id = ?', at(-20 * HOUR), 'sess-long-build');
 
     const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
 
-    expect(digest).toEqual({ sessions: [], claims: [], omitted: 0, partial: true });
+    expect(digest?.sessions.map((s) => s.title)).toEqual(['Long build']);
+    expect(digest?.partial).toBe(false);
+  });
+
+  it('marks the snapshot partial when more sessions hold open lists than it collects', async () => {
+    for (let i = 0; i <= LIVE_WORK_BOUNDS.openListSessions; i++) {
+      await session(`sess-busy-${i}`, `slack:CBUILD:${100 + i}.000`, {
+        title: `Busy ${i}`,
+        items: [{ text: 'Work', status: 'in_progress' }],
+        touchedAt: at(-i * 60 * 1000),
+      });
+    }
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest?.sessions).toHaveLength(LIVE_WORK_BOUNDS.sessions);
+    expect(digest?.omitted).toBe(LIVE_WORK_BOUNDS.openListSessions - LIVE_WORK_BOUNDS.sessions);
+    expect(digest?.partial).toBe(true);
+  }, 30_000);
+
+  it('links a scheduled task’s claim to the thread its output lands in', async () => {
+    await session('sess-dispatch', 'system:tasks:dispatch-abc');
+    await getDb().run(
+      `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
+       VALUES ('sess-dispatch', 'slack', 'slack:CBUILD', '9.000', ?)`,
+      at(-HOUR),
+    );
+    claim('definitions-check', liveClaim('kit', 'system:tasks:dispatch-abc'));
+
+    const digest = await buildLiveWorkDigest(AG, ME, { now: NOW, claimsRoot: CLAIMS_ROOT, linkFor });
+
+    expect(digest?.claims.map((c) => [c.slug, c.owner, c.threadId, c.link])).toEqual([
+      ['definitions-check', 'kit', 'system:tasks:dispatch-abc', 'https://chat.example/slack:CBUILD:9.000'],
+    ]);
   });
 
   it('caps the claims it carries and counts the rest as omitted', async () => {

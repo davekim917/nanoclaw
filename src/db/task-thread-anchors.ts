@@ -57,6 +57,20 @@ export async function deleteTaskThreadAnchor(
   );
 }
 
+/** The thread a task series' session most recently posted into, the series' own thread id having no channel. */
+export async function latestTaskSeriesAnchorThread(seriesThreadId: string): Promise<string | null> {
+  const row = await getDb().get<{ platform_id: string; thread_platform_id: string }>(
+    `SELECT a.platform_id, a.thread_platform_id
+       FROM task_thread_anchors a
+       JOIN sessions s ON s.id = a.session_id
+      WHERE s.thread_id = ?
+      ORDER BY a.created_at DESC
+      LIMIT 1`,
+    seriesThreadId,
+  );
+  return row ? `${row.platform_id}:${row.thread_platform_id}` : null;
+}
+
 /**
  * Rotation granularity: an anchor is reused only while its bucket key matches now's. The UTC calendar day; change the
  * slice length to retune (13 for hourly).

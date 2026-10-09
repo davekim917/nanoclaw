@@ -49,6 +49,16 @@ NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" take acme-pr-733 4 duplicate buil
   && fail "took another session's live claim"
 [ "$(jq -r .note "$CLAIMS_DIR/acme-pr-733.json")" = "publish-gate seam" ] || fail "refused take still wrote"
 
+# 3c. Nor may that other session re-point the claim's thread at itself: that is
+#     how a park refused by 3b was walked around (thread to self, park, thread back).
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" thread acme-pr-733 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours re-pointed the claim's thread"
+[ "$(jq -r .thread_id "$CLAIMS_DIR/acme-pr-733.json")" = "slack:C0AAA:1786621514.008659" ] \
+  || fail "refused thread retarget still wrote"
+NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked from the wrong thread >/dev/null 2>&1 \
+  && fail "another session of yours parked the claim"
+[ "$(jq -r '.status // "live"' "$CLAIMS_DIR/acme-pr-733.json")" = live ] || fail "refused park still wrote"
+
 # 4. A sibling's live claim is refused with exit 3, and the file is untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 stealing it >/dev/null 2>&1 \
   && fail "took a live claim off a sibling"

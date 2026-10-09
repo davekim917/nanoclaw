@@ -29,6 +29,9 @@ export const SELF_HEAL_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export const SELF_HEAL_MAX_NUDGES = 2;
 
+/** An owner that posted in the claim's thread this recently is still working, whatever the claim's TTL says. */
+const LIVE_OWNER_OUTBOUND_WINDOW_MS = 60 * 60 * 1000;
+
 /** Anchored: a note merely mentioning waiting mid-prose is not the discipline. */
 export function isWaitingOnHuman(note: string): boolean {
   return /^\s*waiting on\b/i.test(note);
@@ -191,7 +194,7 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: 
   return (
     `${origin} — the claim \`${claim.slug}\` has stopped moving.\n` +
     `${claimStateLine(claim)}\n\n` +
-    `MOVE the claim before this task ends — there is no fourth option:\n` +
+    `MOVE the claim before this task ends, unless option 4 applies:\n` +
     `1. Finish the work, then \`${claimSh} release ${claim.slug}\`.\n` +
     `2. Stopping without finishing: \`${claimSh} park ${claim.slug} "<what a successor needs to know>"\`. ` +
     `Dead or superseded: \`${claimSh} release ${claim.slug}\`.\n` +
@@ -200,8 +203,10 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: 
     `@-mentions whoever owes it. The mention is what delivers the ask — a notification to a human, a wake to an agent; ` +
     `a plain name reaches neither. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
     `it may land at the top of a channel rather than in the thread you are reading this in.\n` +
+    `4. The work is still being worked in its own thread by a session that is not this one: leave the claim exactly ` +
+    `as it is. Do not park, release, take over or re-thread it, and post nothing; that session moves it when it is done.\n` +
     threadLinkLine(threadUrl) +
-    `\nPost NOTHING for 1 or 2. The claims board and the Observatory already show claim state, so announcing a finish, ` +
+    `\nPost NOTHING for 1, 2 or 4. The claims board and the Observatory already show claim state, so announcing a finish, ` +
     `a release or a park duplicates what a human can already see — and your standing instructions forbid it. Option 3 ` +
     `is the ONLY sanctioned post here, because a blocked hand-off is the one thing no board can show. Do not hedge by ` +
     `posting anyway.\n` +
@@ -295,6 +300,8 @@ export interface SelfHealDeps {
   /** Returns false on failure. */
   createTask?: (input: SelfHealTaskInput) => Promise<boolean>;
   resolveThreadUrl?: (threadId: string) => Promise<string | null>;
+  /** Whether the owner still has a session working the claim's thread; null owner means any agent in the workgroup. */
+  isOwnerLive?: (workgroupId: string, claim: BoardClaim, ownerAgentGroupId: string | null, now: number) => Promise<boolean>;
   enabled?: boolean;
   takeoverEnabled?: boolean;
 }
@@ -580,6 +587,31 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
   return true;
 }
 
+async function defaultIsOwnerLive(
+  workgroupId: string,
+  claim: BoardClaim,
+  ownerAgentGroupId: string | null,
+  now: number,
+): Promise<boolean> {
+  if (!claim.threadId) return false;
+  const { getDb } = await import('../../db/connection.js');
+  const row = await getDb().get<{ id: string }>(
+    `SELECT s.id AS id
+       FROM sessions s
+       JOIN agent_groups ag ON ag.id = s.agent_group_id
+      WHERE ag.workgroup_id = ? AND s.thread_id = ? AND s.status = 'active'
+        AND (? IS NULL OR s.agent_group_id = ?)
+        AND (s.container_status = 'running' OR datetime(s.last_outbound_at) >= datetime(?))
+      LIMIT 1`,
+    workgroupId,
+    claim.threadId,
+    ownerAgentGroupId,
+    ownerAgentGroupId,
+    new Date(now - LIVE_OWNER_OUTBOUND_WINDOW_MS).toISOString(),
+  );
+  return row !== undefined;
+}
+
 async function defaultResolveThreadUrl(threadId: string): Promise<string | null> {
   const { threadPermalink } = await import('../../dashboard/api/observatory.js');
   return threadPermalink(threadId);
@@ -613,6 +645,7 @@ export async function sweepClaimsSelfHeal(
   const resolveSibling = deps.resolveSibling ?? defaultResolveSibling;
   const createTask = deps.createTask ?? defaultCreateTask;
   const resolveThreadUrl = deps.resolveThreadUrl ?? defaultResolveThreadUrl;
+  const isOwnerLive = deps.isOwnerLive ?? defaultIsOwnerLive;
 
   const outcomes: SelfHealOutcome[] = [];
   for (const workgroupId of listWorkgroupDirs(root)) {
@@ -647,6 +680,7 @@ export async function sweepClaimsSelfHeal(
         resolveSibling,
         createTask,
         resolveThreadUrl,
+        isOwnerLive,
       });
       outcomes.push(outcome);
     }
@@ -666,6 +700,7 @@ async function applyDecision(args: {
   resolveSibling: NonNullable<SelfHealDeps['resolveSibling']>;
   createTask: NonNullable<SelfHealDeps['createTask']>;
   resolveThreadUrl: NonNullable<SelfHealDeps['resolveThreadUrl']>;
+  isOwnerLive: NonNullable<SelfHealDeps['isOwnerLive']>;
 }): Promise<SelfHealOutcome> {
   const { workgroupId, claim, root, decision, now, enabled, takeoverEnabled } = args;
   const base = { workgroupId, slug: claim.slug, action: decision.action, reason: decision.reason };
@@ -686,6 +721,15 @@ async function applyDecision(args: {
   }
 
   const owner = await args.resolveOwner(workgroupId, claim);
+  // A claim past its TTL whose owner is still at work is a TTL that ran short, not abandoned work: asking anyone to
+  // move or take it would hand live work to a second session. Spends no rung, so the ladder resumes once it goes quiet.
+  if (
+    (decision.action === 'nudge' || decision.action === 'takeover') &&
+    (await args.isOwnerLive(workgroupId, claim, owner?.agentGroupId ?? null, now))
+  ) {
+    log.info('self-heal: owner still working the claim thread, leaving it', { class: 'stale-claim', ...base });
+    return { ...base, applied: false, reason: 'owner-live' };
+  }
   const target =
     decision.action === 'takeover' ? await args.resolveSibling(workgroupId, claim, owner?.agentGroupId ?? null) : owner;
   if (!target) {

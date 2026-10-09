@@ -422,6 +422,12 @@ cmd_thread() {
     echo "REFUSED — $slug belongs to $owner. Record the thread on your own claim." >&2
     exit 3
   fi
+  local current
+  current="$(jq -r '.thread_id // empty' "$f")"
+  if [ -n "$current" ] && [ -n "${NANOCLAW_THREAD_ID:-}" ] && [ "$current" != "$NANOCLAW_THREAD_ID" ]; then
+    echo "REFUSED — $slug is held by another session of yours (thread $current). Only that session may move its thread." >&2
+    exit 3
+  fi
   note="$(jq -r '.note // ""' "$f")"
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
 
