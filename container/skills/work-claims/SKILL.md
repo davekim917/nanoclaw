@@ -142,9 +142,10 @@ verb uses your own `$NANOCLAW_THREAD_ID`; pass an explicit id only when you are
 recording a thread that is not the one you are running in. It overwrites, so
 re-running it when the work moves threads is correct, and it appends a `thread`
 line to the ledger. Same ownership rule as `park` and `release` — your own
-claim only, and only from the session that holds it: a claim whose `thread_id`
-names another of your threads refuses (exit 3), so a session that is not the
-holder cannot re-point the thread at itself to get past `park`.
+claim only, and only from the session that holds it: a live claim whose
+`thread_id` names another of your threads refuses (exit 3), so a session that is
+not the holder cannot re-point the thread at itself to get past `park`. A stale
+or lapsed-park claim from another thread can be moved.
 
 **Do not assemble a claim with `jq` yourself.** The fields are not a shape to
 remember — `owner`, `session_id` and `thread_id` all come from your environment,
