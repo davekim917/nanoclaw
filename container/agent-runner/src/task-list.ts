@@ -377,7 +377,6 @@ export async function applyTaskListUpdate(
   const ack = await deps.awaitPlatformId(post.id, POST_ACK_TIMEOUT_MS);
   if (ack.platformId) {
     next.platformMessageId = ack.platformId;
-    // Retire only once the replacement is on screen (a failed post passes `supersedes` on). Best effort.
     if (replaced) {
       await retire(replaced.platformMessageId);
       next.supersedes = null;

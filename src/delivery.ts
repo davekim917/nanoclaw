@@ -1292,7 +1292,7 @@ async function deliverMessage(
     deliverMessagingGroupId = mg.id;
   }
   if (msg.kind === 'task_list' && content.operation === 'delete')
-    return retireSupersededTaskList(deliveryAdapter, session, msg);
+    return retireSupersededTaskList(deliveryAdapter, session, msg, deliverInstance);
 
   // Status: the first in a turn posts, later ones edit in place; a real chat message clears the tracking.
   if (msg.kind === 'status') {

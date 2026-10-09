@@ -56,26 +56,43 @@ export function taskListPostReceipt(
   return { taskListRoute: JSON.stringify(route) };
 }
 
-/** A rate limit is rethrown so the row cools down and is retried whole, rather than settling for the stub. */
+/**
+ * The route a retirement may act on: exactly the address the destination check authorized for the row, with only
+ * the thread taken from the host's receipt; null when the receipt is on any other address.
+ */
+function retireRoute(
+  recorded: TaskListPostRoute | null,
+  authorized: Omit<TaskListPostRoute, 'threadId'>,
+): TaskListPostRoute | null {
+  if (
+    !recorded ||
+    recorded.channelType !== authorized.channelType ||
+    recorded.platformId !== authorized.platformId ||
+    recorded.instance !== authorized.instance
+  ) {
+    return null;
+  }
+  return { ...authorized, threadId: recorded.threadId };
+}
+
 export async function retireSupersededTaskList(
   adapter: ChannelDeliveryAdapter,
   session: Session,
   msg: { id: string; content: string; channel_type: string | null; platform_id: string | null },
+  authorizedInstance: string | undefined,
 ): Promise<{ recordOnly: true }> {
   const messageId = (JSON.parse(msg.content) as { messageId?: unknown }).messageId;
+  const { channel_type: authorizedChannel, platform_id: authorizedPlatform } = msg;
   const route =
-    typeof messageId === 'string'
-      ? await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-          mailbox.getTaskListPostRoute(messageId),
+    typeof messageId === 'string' && authorizedChannel && authorizedPlatform
+      ? retireRoute(
+          (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+            mailbox.getTaskListPostRoute(messageId),
+          )) ?? null,
+          { channelType: authorizedChannel, platformId: authorizedPlatform, instance: authorizedInstance ?? null },
         )
       : null;
-  // The row's own address is the one the destination check just authorized.
-  if (
-    !route ||
-    typeof messageId !== 'string' ||
-    route.channelType !== msg.channel_type ||
-    route.platformId !== msg.platform_id
-  ) {
+  if (!route || typeof messageId !== 'string') {
     log.warn('Task list delete refused — target is not a list post this session delivered', {
       id: msg.id,
       sessionId: session.id,

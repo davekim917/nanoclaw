@@ -276,7 +276,6 @@ describe('applyTaskListUpdate', () => {
     expect(out).toMatchObject({ ok: true, action: 'edited' });
     expect(h.state?.generation).toBe(2);
     expect(h.state?.finished).toBe(false);
-    // One post, edited in place — no second list and nothing deleted.
     expect(h.writes).toHaveLength(2);
     expect(h.writes[1].content).toMatchObject({ operation: 'edit', messageId: '1786621600.001' });
     expect(String(h.writes[1].content.text)).toContain('Second');
@@ -340,7 +339,6 @@ describe('applyTaskListUpdate', () => {
     await applyTaskListUpdate(input('Next', items(['B', 'in_progress']), true), SLACK, h.deps);
     expect(h.writes).toHaveLength(2);
     expect(h.state?.supersedes).toEqual({ outboundId: 'out-1', platformMessageId: '1786621600.001' });
-    // The next fresh post inherits the replacement and deletes the original once it shows.
     h.setDeliver('ok');
     await applyTaskListUpdate(input('Next', items(['B', 'done'])), SLACK, h.deps);
     expect(h.writes[3].content).toEqual({ operation: 'delete', messageId: '1786621600.001' });

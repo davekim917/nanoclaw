@@ -813,11 +813,22 @@ describe('task list delivery (switch on)', () => {
       expect(calls).toHaveLength(1);
       await getDb().run(`DELETE FROM agent_destinations WHERE agent_group_id = 'ag-1' AND target_id = 'mg-2'`);
       retire(sessionId, 'retire-other', 'plat-1', { platformId: OTHER, threadId: null });
-      // The same post named from the session's own address does not match where it was posted.
       retire(sessionId, 'retire-origin', 'plat-1');
       for (let i = 0; i < 3; i++) await deliverSessionMessages(session);
       expect(deleted).toEqual([]);
       expect(calls).toHaveLength(1);
+    });
+
+    it('is neither deleted nor edited through an adapter instance other than the one it was posted by', async () => {
+      const sessionId = await seed();
+      const { calls, deleted } = deletingAdapter();
+      const session = await postList(sessionId);
+      await getDb().run(`UPDATE messaging_groups SET instance = 'slack-sibling' WHERE id = 'mg-1'`);
+      retire(sessionId);
+      await deliverSessionMessages(session);
+      expect(deleted).toEqual([]);
+      expect(calls).toHaveLength(1);
+      expect(await delivered(sessionId)).toContain('retire-1');
     });
 
     it('waits out a rate-limited delete, even past an answer, and never falls back to the stub', async () => {

@@ -241,10 +241,7 @@ export interface TaskListPostRoute {
   instance: string | null;
 }
 
-/**
- * Where the host delivered the task-list post now shown as `platformMessageId`, read from the host-owned receipt.
- * A container-written row is no proof: the container can rewrite its own outbound rows after delivery.
- */
+/** A container-written row is no proof: the container can rewrite its own outbound rows after delivery. */
 export function getTaskListPostRoute(inbound: Database.Database, platformMessageId: string): TaskListPostRoute | null {
   const row = inbound
     .prepare(
