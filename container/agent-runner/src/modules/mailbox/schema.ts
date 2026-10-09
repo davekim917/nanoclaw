@@ -187,4 +187,5 @@ export function ensureNanoclawInboundTestSchema(inbound: Database): void {
     (inbound.prepare("PRAGMA table_info('delivered')").all() as Array<{ name: string }>).map((c) => c.name),
   );
   if (!deliveredCols.has('error')) inbound.exec('ALTER TABLE delivered ADD COLUMN error TEXT');
+  if (!deliveredCols.has('notice')) inbound.exec('ALTER TABLE delivered ADD COLUMN notice TEXT');
 }

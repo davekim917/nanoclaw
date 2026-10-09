@@ -65,6 +65,9 @@ export function migrateDeliveredTable(db: Database.Database): void {
   if (!cols.has('lifecycle_terminal_at')) {
     db.prepare('ALTER TABLE delivered ADD COLUMN lifecycle_terminal_at TEXT').run();
   }
+  if (!cols.has('notice')) {
+    db.prepare('ALTER TABLE delivered ADD COLUMN notice TEXT').run();
+  }
 }
 
 /** Here, not ops/fence.ts, because placing it there makes a static import cycle. */

@@ -72,6 +72,21 @@ export function readDeliveredRow(messageOutId: string): DeliveredRow | undefined
     .get(messageOutId) as DeliveredRow | undefined;
 }
 
+/**
+ * The host's note to the agent about one delivered row (a routing veto), written with the delivered row itself. Null
+ * when there is none, including on a host that predates the column.
+ */
+export function readDeliveryNotice(messageOutId: string): string | null {
+  try {
+    const row = getInboundDb().prepare('SELECT notice FROM delivered WHERE message_out_id = ?').get(messageOutId) as
+      | { notice: string | null }
+      | undefined;
+    return row?.notice ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Highest outbound seq written so far, 0 when none — a watermark for `hasChatOutboundAfter`. */
 export function maxOutboundSeq(): number {
   const row = getOutboundDb().prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as { seq: number | null };

@@ -550,6 +550,34 @@ CREATE INDEX idx_mcp_oauth_integrations_status ON mcp_oauth_integrations (status
 
 ---
 
+### 1.23 `thread_route_checks`
+
+One row per routing check on an `lb-` keyed post (`src/thread-route-check.ts`; see [agent-runner-details.md](agent-runner-details.md), "Keyed threads"): the Jev score a candidate thread got for the post, the threshold, and what the host did, kept so the threshold can be re-tuned on live decisions. Added by migration 086; written only by the check. `score` is NULL when the check failed and `error` says why; `split_thread_key` is set when a `handoff` into a key's own thread was vetoed.
+
+```sql
+CREATE TABLE thread_route_checks (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  checked_at           TEXT NOT NULL,
+  agent_group_id       TEXT NOT NULL,
+  messaging_group_id   TEXT NOT NULL,
+  session_id           TEXT NOT NULL,
+  message_out_id       TEXT NOT NULL,
+  thread_key           TEXT NOT NULL,
+  check_point          TEXT NOT NULL,   -- a: continue_thread adoption, b: the key's own thread, c: adoption outside 48h
+  candidate_thread_id  TEXT NOT NULL,
+  thread_last_activity TEXT,
+  score                REAL,
+  threshold            REAL NOT NULL,
+  decision             TEXT NOT NULL,   -- keep|veto
+  latency_ms           INTEGER NOT NULL,
+  model                TEXT NOT NULL,
+  error                TEXT,
+  split_thread_key     TEXT
+);
+```
+
+---
+
 ## 2. Migration system
 
 Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMigrations()` in `src/db/migrations/index.ts`. It:

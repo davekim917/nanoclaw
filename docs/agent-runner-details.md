@@ -622,6 +622,27 @@ message on the same `channel_type` + `platform_id` in it. Adopted → post there
 thread as the key's anchor, so later posts under the key follow it. Unconfirmed → a warn log
 and the ordinary root post. A live anchor always wins and the argument is ignored.
 
+**Routing check (`lb-` keys only).** For a key starting with `lb-` (littlebird-watch topics), the host
+asks Jev (`src/thread-route-check.ts`, model pinned `jev-1.13.0`) whether the existing thread is already
+working the post's request, judged on the post text and the thread's opener plus its five newest messages
+from the archive. It runs at two points: a `continue_thread` adoption (any purpose), and a `handoff` post
+under a key that already has a thread. Below `ROUTE_CHECK_THRESHOLD` (0.35), and on any failure (Jev
+error or timeout, no gateway credential, empty or unreadable archive, a score that cannot be stored, a
+check not finished 20 s after the runner queued the post), the post opens a new root thread instead:
+
+- **Adoption vetoed** → the key's anchor becomes the new root, exactly as for an unconfirmed `continue_thread`.
+- **Handoff into the key's own thread vetoed** → the earlier key keeps its anchor; the post's root is
+  recorded under the split key `<key>.split-<outbound id>` (`src/thread-route-split.ts`, mirrored in
+  the runner), and the delivery ack carries a `notice` naming it.
+
+The check runs in the background (`routeVerdict`, `src/thread-route-verdict.ts`): the post stays queued
+behind it in its own session, and a later delivery cycle sends it from the stored verdict, so no other
+session's delivery waits on Jev. A retried row reuses its verdict. A kept verdict whose post cannot go out
+within 40 s of queueing becomes a veto, because by then the runner has stopped waiting.
+`send_message` waits for that ack (up to 45 s) on an `lb-` `handoff` post only, and returns the notice;
+later posts follow the new thread only if the agent uses the key the notice names. Every decision is
+stored in `thread_route_checks`. Every other key, and an unkeyed post, never reaches the check.
+
 A keyed post takes precedence over both unkeyed anchors — the rolling per-session day anchor
 for task sessions (`task_thread_anchors`, rotated by `anchorRotationKey` in
 `src/db/task-thread-anchors.ts`, opt-out `ncl tasks … --thread-anchor false`) and the
