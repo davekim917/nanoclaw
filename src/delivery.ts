@@ -1106,8 +1106,6 @@ async function deliverMessage(
   if (msg.kind === 'task_list' && (!TASK_LIST_ENABLED || (await isSpawnChildSession(session.id)))) {
     return { recordOnly: true };
   }
-  if (msg.kind === 'task_list' && content.operation === 'delete')
-    return retireSupersededTaskList(deliveryAdapter, session, msg);
 
   let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
@@ -1293,6 +1291,8 @@ async function deliverMessage(
     deliverInstance = mg.instance;
     deliverMessagingGroupId = mg.id;
   }
+  if (msg.kind === 'task_list' && content.operation === 'delete')
+    return retireSupersededTaskList(deliveryAdapter, session, msg);
 
   // Status: the first in a turn posts, later ones edit in place; a real chat message clears the tracking.
   if (msg.kind === 'status') {

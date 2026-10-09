@@ -43,7 +43,6 @@ export function supersededTaskListEdits(
 
 const TASK_LIST_SUPERSEDED_STUB = 'Latest task list below ↓';
 
-/** The route a task-list POST was delivered on, recorded host-side so retiring it never trusts the container. */
 export function taskListPostReceipt(
   kind: string,
   content: { operation?: unknown },
@@ -57,14 +56,11 @@ export function taskListPostReceipt(
   return { taskListRoute: JSON.stringify(route) };
 }
 
-/**
- * Deleted on the route its post was delivered on; where the adapter cannot delete or the delete throws, edited to
- * a plain stub. A rate limit is rethrown so the row cools down and is retried whole.
- */
+/** A rate limit is rethrown so the row cools down and is retried whole, rather than settling for the stub. */
 export async function retireSupersededTaskList(
   adapter: ChannelDeliveryAdapter,
   session: Session,
-  msg: { id: string; content: string },
+  msg: { id: string; content: string; channel_type: string | null; platform_id: string | null },
 ): Promise<{ recordOnly: true }> {
   const messageId = (JSON.parse(msg.content) as { messageId?: unknown }).messageId;
   const route =
@@ -73,7 +69,13 @@ export async function retireSupersededTaskList(
           mailbox.getTaskListPostRoute(messageId),
         )
       : null;
-  if (!route || typeof messageId !== 'string') {
+  // The row's own address is the one the destination check just authorized.
+  if (
+    !route ||
+    typeof messageId !== 'string' ||
+    route.channelType !== msg.channel_type ||
+    route.platformId !== msg.platform_id
+  ) {
     log.warn('Task list delete refused — target is not a list post this session delivered', {
       id: msg.id,
       sessionId: session.id,
