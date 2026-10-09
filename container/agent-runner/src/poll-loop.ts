@@ -839,7 +839,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     /** Set when every attempt threw, so the `finally` can synthesise a failure. */
     let fireErrorMessage: string | undefined;
     const initialTurnKey = processingIds.join(',');
-    let providerAnswered = false;
     try {
       const result = await processQuery(
         query,
@@ -862,7 +861,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
-      providerAnswered = true;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -1173,7 +1171,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // routes to the fallback; only a recognized quota also silences the chat
       // error. The fire's failure is only recorded here: the `finally` decides
       // whether to write it, since `deferredToFallback` is set below.
-      providerAnswered = recovered;
       if (fireOutcomes.size === 0) fireErrorMessage = errMsg;
       if (deferredForRepositoryBarrier) releaseProcessingClaims(processingIds);
       const quotaHandled =
@@ -1267,13 +1264,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } else {
       markCompleted(processingIds);
       log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
-      if (providerAnswered) {
-        await confirmProviderTurn(
-          keep,
-          { providerName: config.providerName, onFallback: config.providerFallbackActive === true },
-          log,
-        );
-      }
     }
   }
 }
@@ -1482,10 +1472,9 @@ export async function processQuery(
       platformId: own ? human.platform_id : from.platformId,
     };
   };
-  let humanReplyOwed: ReplyDebt | null = replyDebt(
-    initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
-    routing,
-  );
+  const initialBatch = initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null);
+  let humanReplyOwed: ReplyDebt | null = replyDebt(initialBatch, routing);
+  let providerTurnConfirmed = false;
   // Retryable events (SDK `api_retry`) are the SDK's own mid-stream retry, not
   // turn-ending: surface the last only if the stream ends without a result.
   let sawResult = false;
@@ -2105,6 +2094,14 @@ export async function processQuery(
         // Complete the initial batch now so the sweep sees no stale claims
         // while the query stays open.
         markCompleted(initialBatchIds);
+        if (!providerTurnConfirmed && event.isError !== true) {
+          providerTurnConfirmed = true;
+          await confirmProviderTurn(
+            initialBatch,
+            { providerName, onFallback: options.providerFallbackActive === true },
+            log,
+          );
+        }
         // Only pushes this result CONSUMED; one still queued stays claimed.
         const answered = event.answeredPrompts;
         completeConsumedFollowUps(

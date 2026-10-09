@@ -63,6 +63,34 @@ class OneTurnProvider implements AgentProvider {
   }
 }
 
+/** Like the real providers: the event stream stays open after a `result`, waiting for follow-up pushes. */
+class OpenStreamProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+  registerMemorySessionHook(): void {}
+  isSessionInvalid(): boolean {
+    return false;
+  }
+  query(_input: QueryInput): AgentQuery {
+    let release: () => void = () => {};
+    const closed = new Promise<void>((resolve) => (release = resolve));
+    const events = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'init', continuation: 'codex-thread-2' } as const;
+        yield { type: 'result', text: '' } as const;
+        await closed;
+      },
+    };
+    return {
+      resolvedModel: 'gpt-test',
+      resolvedEffort: null,
+      push() {},
+      end: () => release(),
+      events,
+      abort: () => release(),
+    } as AgentQuery;
+  }
+}
+
 /** A saved conversation that cannot be resumed, then a fresh one that answers. */
 class StaleThenFreshProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
@@ -120,6 +148,12 @@ describe('returning from a provider fallback', () => {
     const report = outRows().find((r) => r.content.action === 'provider_turn_completed')!.content;
     expect(report.provider).toBe('codex');
     expect(Number.isFinite(Date.parse(String(report.completedAt)))).toBe(true);
+  });
+
+  it('does not wait for the query stream to close before telling the thread and the host', async () => {
+    await runUntil(new OpenStreamProvider(), () => actions().includes('provider_turn_completed'));
+
+    expect(chatTexts()).toEqual(['⚙️ codex is available again — this thread has moved back from claude.']);
   });
 
   it('says nothing and clears nothing when the primary fails the return wake', async () => {
