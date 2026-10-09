@@ -32,7 +32,7 @@ const LATEST_CHARS = 300;
 const HOST_COPY_SENDER = 'assistant';
 
 const ABOUT =
-  "Dave keeps one Discord thread per request he is handling. A new Slack message to Dave is in `new_message`. Each candidate thread is one of Dave's threads from the last 48 hours: its opening message, written by Dave or by Axie (Dave's assistant, which opens a thread when it logs a request), and, when shown, its latest messages.";
+  "The operator keeps one Discord thread per request they are handling. A new Slack message to the operator is in `new_message`. Each candidate thread is one of the operator's threads from the last 48 hours: its opening message, written by the operator or by the operator's assistant (which opens a thread when it logs a request), and, when shown, its latest messages.";
 const QUESTION =
   'Is `candidate_thread` already working on the same request as `new_message`, meaning the same deliverable or the same open question, so that `new_message` should be posted into that thread?';
 const CRITERIA = {

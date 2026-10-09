@@ -1,0 +1,114 @@
+{
+  "case": "Fictional misroute: a request to trial a new inventory dashboard with 6 branch leads, posted with continue_thread into a thread planning shift-roster automation for the same person",
+  "channelType": "discord",
+  "platformId": "discord:111111111111111111:222222222222222222",
+  "threadPlatformId": "123456789000000100",
+  "checkedAt": "2026-10-08T18:03:09.000Z",
+  "postText": "Inventory dashboard trial for 6 branch leads, Jordan\nSlack DM · Jordan Example · Thu 1:54 PM ET\nASK: Jordan has 6 branch leads to try the new inventory dashboard for a week; asks if she just sends you their names and branches.\nBUCKET: DRAFT (access setup plus a reply for your approval)\nhttps://example.slack.com/archives/DEXAMPLE02/p1700000000000002",
+  "messages": [
+    {
+      "id": "123456789000000100:sibling-a",
+      "senderName": "Morgan",
+      "sentAt": "2026-10-07T17:31:00.000Z",
+      "text": "@Wren https://example.slack.com/archives/CEXAMPLE01/p1700000000000001 right now Jordan builds the weekly shift roster for the bakery branches by hand. This message has the spreadsheet she fills in every Friday and the staffing rules behind it. Can you draft a plan to automate the early, day and late shift roster so the ops analysts can own it?"
+    },
+    {
+      "id": "123456789000000101:sibling-a",
+      "senderName": "Wren",
+      "sentAt": "2026-10-07T21:10:00.000Z",
+      "text": "Rewrote post 1 as your starting point for them to take over. The work split is gone. Post 2 is unchanged. Post 1 (brief and HTML attached): @Riley @Casey Here's a first pass at a plan for automating the early, day and late shift roster, based on Jordan's spreadsheet and the staffing rules she shared. The HTML walks through the inputs, the rules and a proposed schedule."
+    },
+    {
+      "id": "msg-1791400000000-aaaaaa",
+      "senderName": "assistant",
+      "sentAt": "2026-10-07T21:10:00.200Z",
+      "text": "Rewrote post 1 as your starting point for them to take over. The work split is gone. Post 2 is unchanged."
+    },
+    {
+      "id": "123456789000000102:sibling-a",
+      "senderName": "Morgan",
+      "sentAt": "2026-10-07T21:20:00.000Z",
+      "text": "@Wren don't quote my instruction back to them, just set the tone. They own it from here."
+    },
+    {
+      "id": "123456789000000103:sibling-a",
+      "senderName": "Wren",
+      "sentAt": "2026-10-07T21:25:00.000Z",
+      "text": "You're right, I pasted your instruction into the message when it should have set the tone. That line is gone, and the questions now carry the handoff. Post 2 is unchanged. Post 1 (brief and HTML attached): @Riley @Casey Here's a first pass at a plan for automating the shift roster."
+    },
+    {
+      "id": "123456789000000104:sibling-a",
+      "senderName": "Morgan",
+      "sentAt": "2026-10-07T21:30:00.000Z",
+      "text": "@Wren send it"
+    },
+    {
+      "id": "123456789000000105:sibling-a",
+      "senderName": "Wren",
+      "sentAt": "2026-10-07T21:40:00.000Z",
+      "text": "Sent both in the group DM as you. Post 1 to Riley and Casey has the plan HTML and the brief attached. Post 2 asks Jordan the four rule questions about split shifts, break cover and the holiday rota. Verified: read back from Slack, both posts as Morgan, both files attached."
+    },
+    {
+      "id": "msg-1791400000000-bbbbbb",
+      "senderName": "assistant",
+      "sentAt": "2026-10-07T21:40:00.200Z",
+      "text": "Sent both in the group DM as you. Post 1 to Riley and Casey has the plan HTML and the brief attached."
+    }
+  ],
+  "request": {
+    "model": "jev-1.13.0",
+    "state": {
+      "new_message": "Inventory dashboard trial for 6 branch leads, Jordan\nSlack DM · Jordan Example · Thu 1:54 PM ET\nASK: Jordan has 6 branch leads to try the new inventory dashboard for a week; asks if she just sends you their names and branches.\nBUCKET: DRAFT (access setup plus a reply for your approval)\nhttps://example.slack.com/archives/DEXAMPLE02/p1700000000000002"
+    },
+    "questions": {
+      "same_request": {
+        "type": "noul",
+        "instructions": {
+          "about": "The operator keeps one Discord thread per request they are handling. A new Slack message to the operator is in `new_message`. Each candidate thread is one of the operator's threads from the last 48 hours: its opening message, written by the operator or by the operator's assistant (which opens a thread when it logs a request), and, when shown, its latest messages.",
+          "candidate_thread": {
+            "opened_by": "Morgan",
+            "opening_message": "@Wren https://example.slack.com/archives/CEXAMPLE01/p1700000000000001 right now Jordan builds the weekly shift roster for the bakery branches by hand. This message has the spreadsheet she fills in every Friday and the staffing rules behind ...",
+            "message_count": 8,
+            "latest_messages": [
+              {
+                "from": "Wren",
+                "text": "Rewrote post 1 as your starting point for them to take over. The work split is gone. Post 2 is unchanged. Post 1 (brief and HTML attached): @Riley @Casey Here's a first pass at a plan for automating the early, day and late shift roster, based on Jordan's spreadsheet and the staffing rules she shared..."
+              },
+              {
+                "from": "Morgan",
+                "text": "@Wren don't quote my instruction back to them, just set the tone. They own it from here."
+              },
+              {
+                "from": "Wren",
+                "text": "You're right, I pasted your instruction into the message when it should have set the tone. That line is gone, and the questions now carry the handoff. Post 2 is unchanged. Post 1 (brief and HTML attached): @Riley @Casey Here's a first pass at a plan for automating the shift roster."
+              },
+              {
+                "from": "Morgan",
+                "text": "@Wren send it"
+              },
+              {
+                "from": "Wren",
+                "text": "Sent both in the group DM as you. Post 1 to Riley and Casey has the plan HTML and the brief attached. Post 2 asks Jordan the four rule questions about split shifts, break cover and the holiday rota. Verified: read back from Slack, both posts as Morgan, both files attached."
+              }
+            ]
+          },
+          "question": "Is `candidate_thread` already working on the same request as `new_message`, meaning the same deliverable or the same open question, so that `new_message` should be posted into that thread?"
+        },
+        "criteria": {
+          "true": "Same request. `new_message` follows up on the specific thing that thread is working on: it answers a question asked there, adds input or files for it, asks for its status, or repeats the same ask.",
+          "false": "Different request. The thread works on a different deliverable or question, even if it involves the same person, team, system or subject area."
+        }
+      }
+    }
+  },
+  "response": {
+    "model": "jev-1.13.0",
+    "answers": {
+      "same_request": {
+        "type": "noul",
+        "noul": 0.03
+      }
+    }
+  },
+  "liveScores": [0.03, 0.03, 0.03]
+}
