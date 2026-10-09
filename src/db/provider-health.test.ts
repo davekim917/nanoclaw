@@ -136,6 +136,16 @@ describe('provider health cooldown', () => {
     expect(await markProviderAvailable(GID, 'codex', { nowMs: NOW + 3 })).toBe(false);
   });
 
+  it('a success older than the recorded failure leaves it in place', async () => {
+    await markProviderUnavailable(GID, 'codex', 'unavailable', { nowMs: NOW });
+    const before = new Date(NOW - 1).toISOString();
+    expect(await markProviderAvailable(GID, 'codex', { nowMs: NOW + 1, answeredAt: before })).toBe(false);
+    expect((await getProviderHealth(GID, 'codex'))?.consecutive_failures).toBe(1);
+    expect(await markProviderAvailable(GID, 'codex', { nowMs: NOW + 2, answeredAt: new Date(NOW).toISOString() })).toBe(
+      true,
+    );
+  });
+
   it('a fresh episode starts at the first backoff, not where the last one ended', async () => {
     // The streak must reset once an outage is over, or a provider healthy for
     // weeks would reopen at the 6h cap. markProviderAvailable is what the

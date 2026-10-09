@@ -62,7 +62,6 @@ import {
   type ContainerResources,
 } from './container-resources.js';
 import { applyProviderFallbackRuntime, providerFallbackRuntimeEnv, resolveSpawnProvider } from './provider-fallback.js';
-import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import {
   CONTAINER_RUNTIME_BIN,
@@ -1348,10 +1347,6 @@ async function spawnContainer(
       fallbackProvider: providerDecision.provider,
       model: providerDecision.model,
     });
-  }
-  if (!providerDecision.fallbackApplied) {
-    // Close the outage episode, or the failure streak grows forever and the next outage opens at the 6h backoff cap.
-    await markProviderAvailable(agentGroup.id, providerDecision.primaryProvider);
   }
   // Local shadow: the fallback must beat a stamped session row for THIS spawn
   // without persisting a provider change to the session.

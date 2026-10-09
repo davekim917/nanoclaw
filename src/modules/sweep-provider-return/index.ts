@@ -18,10 +18,8 @@ import {
   asSessionContext,
   registerSweepDuty,
   registerSweepDutySource,
-  withStoppedContainerSession,
   writeSystemWake,
   type ContainerObservation,
-  type SessionRunner,
   type SweepSessionContext,
   type WakePlan,
 } from '../../host-sweep.js';
@@ -30,8 +28,6 @@ import { resolveProviderName } from '../../db/container-configs.js';
 import { isProviderUnavailable } from '../../db/provider-health.js';
 import { PROVIDER_FALLBACK_APPLIED_ENV } from '../../provider-fallback.js';
 import { requestWake } from '../../request-wake.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
-import type { Session } from '../../types.js';
 
 const PROVIDER_RETURN_ID_PREFIX = 'provider-return-';
 /** Synchronous on the host's only event loop: a stalled runtime must cost this attempt, not every session. */
@@ -95,27 +91,6 @@ export function _resetProviderReturnForTesting(): void {
 
 export function _fallbackMarkerCacheSizeForTesting(): number {
   return fallbackMarkerBySession.size;
-}
-
-async function noteReturnInThread(session: Session, primaryProvider: string, fallbackProvider: string): Promise<void> {
-  const run: SessionRunner = (action) => withExistingMailboxSession(session.agent_group_id, session.id, action);
-  const written = await withStoppedContainerSession(run, session, (mailbox) => {
-    const routing = mailbox.readSessionRouting();
-    if (!routing) return false;
-    mailbox.writeOutboundDirect({
-      id: `${PROVIDER_RETURN_ID_PREFIX}note-${Date.now()}`,
-      kind: 'chat',
-      platformId: routing.platform_id,
-      channelType: routing.channel_type,
-      threadId: routing.thread_id,
-      content: JSON.stringify({
-        text: `⚙️ ${primaryProvider} is available again — this thread is moving back from ${fallbackProvider}.`,
-        _system: { kind: 'provider_fallback_return', provider: primaryProvider, from: fallbackProvider },
-      }),
-    });
-    return true;
-  });
-  if (!written) log.info('provider-return: thread note skipped', { sessionId: session.id });
 }
 
 export async function sweepProviderReturn(
@@ -182,12 +157,6 @@ export async function sweepProviderReturn(
     session.id,
     'provider fallback ended — returning to the primary',
     async () => {
-      // Another session can re-record the outage before this exit, and the respawn would then land on the fallback.
-      if (!(await isProviderUnavailable(session.agent_group_id, primaryProvider))) {
-        await noteReturnInThread(session, primaryProvider, fallbackProvider).catch((err) =>
-          log.warn('provider-return: thread note failed', { sessionId: session.id, err }),
-        );
-      }
       await requestWake(session, 'container-restart', {
         priority: 'interactive',
         guard: sessionStillActive(session.id),

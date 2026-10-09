@@ -105,6 +105,7 @@ import type {
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { recordWorktreeInFlight, snapshotWorktrees } from './worktree-in-flight.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
+import { confirmProviderTurn, markProviderTurnUnconfirmed } from './provider-turn-completed.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
 import { loadTaskListState, markTaskListStale, taskListEnabled, taskListReminder } from './task-list.js';
@@ -174,6 +175,10 @@ function formatCredentialRetryPrompt(
 // costs another full 5 min, so retry once.
 const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
+
+export const STALE_SESSION_NOTICE =
+  '[Your saved conversation could not be resumed, so this is a fresh session and your conversation memory was ' +
+  'reset. Catch up from this thread and your durable notes before acting.]\n\n';
 
 export function buildWorkContinuationPrompt(task: string): string {
   return (
@@ -302,6 +307,7 @@ async function reportProviderUnavailable(
         buildProviderUnavailableReport(activeProvider, recognizedQuota, message, fallbackProvider, detail),
       ),
     });
+    markProviderTurnUnconfirmed();
     const suppress = !alreadyOnFallback;
     log(
       `Provider ${activeProvider} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
@@ -833,6 +839,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     /** Set when every attempt threw, so the `finally` can synthesise a failure. */
     let fireErrorMessage: string | undefined;
     const initialTurnKey = processingIds.join(',');
+    let providerAnswered = false;
     try {
       const result = await processQuery(
         query,
@@ -855,6 +862,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
+      providerAnswered = true;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -1084,10 +1092,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
-            (recap
-              ? wrapRecap(recap, 'stale-session-recovered')
-              : '[The prior agent session transcript was unavailable and could not be resumed. Starting a fresh session.]\n\n') +
-              prompt,
+            STALE_SESSION_NOTICE + (recap ? wrapRecap(recap, 'stale-session-recovered') : '') + prompt,
           );
           freshContextBootstrapRequired = false;
           await retryInTurn(retryPrompt, undefined, effectiveModel);
@@ -1168,6 +1173,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // routes to the fallback; only a recognized quota also silences the chat
       // error. The fire's failure is only recorded here: the `finally` decides
       // whether to write it, since `deferredToFallback` is set below.
+      providerAnswered = recovered;
       if (fireOutcomes.size === 0) fireErrorMessage = errMsg;
       if (deferredForRepositoryBarrier) releaseProcessingClaims(processingIds);
       const quotaHandled =
@@ -1261,6 +1267,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } else {
       markCompleted(processingIds);
       log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
+      if (providerAnswered) {
+        await confirmProviderTurn(
+          keep,
+          { providerName: config.providerName, onFallback: config.providerFallbackActive === true },
+          log,
+        );
+      }
     }
   }
 }

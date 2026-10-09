@@ -30,6 +30,12 @@ const CODEX_INITIALIZE_CAPABILITIES = {
 /** Only these errors fall back to a fresh thread; shared with codex.ts's `isSessionInvalid`. */
 export const STALE_THREAD_RE = /thread\s+not\s+found|unknown\s+thread|thread[_\s]id|no such thread/i;
 
+/**
+ * An app-server that answered `initialize` but not `thread/resume` is stuck on one saved conversation, not out of
+ * service, so the caller starts a fresh thread instead of reporting an outage; `isSessionInvalid` matches this.
+ */
+export const RESUME_TIMEOUT_RE = /thread\/resume timed out/i;
+
 /** Rejects newlines, which in an MCP value are misconfiguration (e.g. a secret with a trailing newline). */
 function tomlBasicString(value: string): string {
   if (value.includes('\n') || value.includes('\r')) {
@@ -342,10 +348,18 @@ export async function startOrResumeCodexThread(
 ): Promise<string> {
   if (threadId) {
     log(`Resuming thread: ${threadId}`);
-    const resp = await sendCodexRequest(server, 'thread/resume', {
-      threadId,
-      ...(params as unknown as Record<string, unknown>),
-    });
+    let resp: JsonRpcResponse;
+    try {
+      resp = await sendCodexRequest(server, 'thread/resume', {
+        threadId,
+        ...(params as unknown as Record<string, unknown>),
+      });
+    } catch (err) {
+      if (err instanceof CodexRequestTimeoutError) {
+        throw new Error(`thread/resume timed out for saved thread ${threadId}: ${err.message}`);
+      }
+      throw err;
+    }
     if (!resp.error) {
       log(`Thread resumed: ${threadId}`);
       return threadId;

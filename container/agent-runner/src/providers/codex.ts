@@ -22,6 +22,7 @@ import {
   type CodexMcpServer,
   DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION,
   type JsonRpcNotification,
+  RESUME_TIMEOUT_RE,
   STALE_THREAD_RE,
   attachCodexAutoApproval,
   createCodexConfigOverrides,
@@ -797,7 +798,7 @@ export class CodexProvider implements AgentProvider {
 
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
-    return STALE_THREAD_RE.test(msg);
+    return STALE_THREAD_RE.test(msg) || RESUME_TIMEOUT_RE.test(msg);
   }
 
   /**
