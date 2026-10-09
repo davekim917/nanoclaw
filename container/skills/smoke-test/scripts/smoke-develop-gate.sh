@@ -185,6 +185,10 @@ num_env UNSETTLED_ALERT_SECONDS SMOKE_GATE_UNSETTLED_ALERT_SECONDS 2700
 # comparison, which for a wait bound means never bounding the wait at all.
 num_env WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_INTERVAL_SECONDS 300
 num_env WAIT_MAX_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS 2700
+# Wall-clock budget for rebuilding a capped deploy-lag file set (below). The
+# scheduled watcher runs as a pre-task script that is killed at 120s, so the
+# rebuild must stop well inside that and leave room for the rest of the run.
+num_env LAG_BUDGET_SECONDS SMOKE_GATE_LAG_BUDGET_SECONDS 60
 # Optional readiness command run immediately before a campaign is opened, for
 # preconditions this gate cannot see: test-account liveness, a seeded fixture,
 # a reachable dependency. Exit 0 = go. Non-zero = the campaign never opens and
@@ -1607,11 +1611,101 @@ if [ "$CHECK_TOTAL" -gt 0 ] && [ "$CHECK_SUCCESS" -gt 0 ] && [ "$CHECK_PENDING" 
 fi
 # Is a lagging live deploy still the correct artifact for the source SHA?
 # True only when the deployed SHA is a strict ancestor of source AND no file
-# changed between them touches this service's paths. Fail-closed: unset paths,
-# any fetch problem, a non-ancestor state, or a truncated (300-file) compare
-# all return false.
+# changed between them touches this service's paths. A rename counts both its
+# old and new path, so moving a file out of a service still touches it.
+# Fail-closed: unset paths, any fetch problem or a non-ancestor state all
+# return false.
+# GitHub caps a compare's file list at 300, so a capped list cannot prove a
+# path untouched. At the cap the file set is rebuilt as the union of every
+# range commit's own (paginated) file list: a file the range changes is changed
+# by at least one of its commits, so the union is a superset of the net diff.
+# That rebuild refuses unless the compare's commit list is exactly the range:
+# an array of ahead_by distinct 40-hex SHAs, ahead_by at most LAG_MAX_COMMITS
+# (GitHub's compare lists at most 250). It also refuses when one commit reaches
+# GitHub's 3000-file cap on its own list.
+# Each commit's list is cached by SHA as soon as it is fetched, so a rebuild
+# that runs out of LAG_BUDGET_SECONDS (or is killed) refuses this time and the
+# next run continues from where it stopped instead of starting over. Cost: one
+# request per file page (1-30 per commit), paid once per commit.
+LAG_MAX_COMMITS=250
+LAG_PAGE_SIZE=100
+LAG_COMMIT_DIR="$STATE_DIR/lag-commits"
+# Cached per-commit lists are derived data in the gate's private STATE_DIR and
+# `check` writes them too: `check` stays read-only for gate state, claims and
+# leases. A record's header binds repository, commit, line count and a sha256 of
+# the body; a record that does not match is ignored and refetched. That catches
+# truncation and a record from another repository or commit, not a deliberate
+# edit by someone who can write STATE_DIR (the cache trusts its writer, like the
+# rest of that directory). A fetch that fails is never cached.
+lag_commit_file() { printf '%s/%s-%s.txt' "$LAG_COMMIT_DIR" "$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9._-' '_')" "$1"; }
+lag_commit_read() {
+  local content header body
+  content="$(cat "$(lag_commit_file "$1")" 2>/dev/null)" || return 1
+  header="${content%%$'\n'*}"
+  if [ "$header" = "$content" ]; then body=""; else body="${content#*$'\n'}"; fi
+  if [ "$header" = "#lag-commit v4 $REPO $1 capped" ] && [ -z "$body" ]; then printf 'capped'; return 0; fi
+  [ "$header" = "#lag-commit v4 $REPO $1 $(printf '%s' "$body" | grep -c . || true) $(printf '%s' "$body" | sha256sum | cut -c1-64)" ] || return 1
+  printf '%s' "$body"
+}
+lag_commit_write() {  # <sha> <header-tail> <body>
+  local f; f="$(lag_commit_file "$1")"
+  mkdir -p "$LAG_COMMIT_DIR" 2>/dev/null || return 0
+  { printf '#lag-commit v4 %s %s %s\n' "$REPO" "$1" "$2"; printf '%s' "$3"; } > "$f.tmp.$$" 2>/dev/null &&
+    mv -f "$f.tmp.$$" "$f" 2>/dev/null || rm -f "$f.tmp.$$" 2>/dev/null
+  return 0
+}
+lag_range_files() {
+  local out="$1" commits c listed names rem
+  commits="$(jq -r --argjson max "$LAG_MAX_COMMITS" '
+    if (.commits | type) == "array" and (.ahead_by | type) == "number"
+       and .ahead_by >= 1 and .ahead_by <= $max and (.commits | length) == .ahead_by
+       and all(.commits[]; (.sha | type) == "string" and (.sha | test("^[0-9a-f]{40}$")))
+       and ((.commits | map(.sha) | unique | length) == (.commits | length))
+    then .commits[].sha else error("range") end' <<<"$out" 2>/dev/null)" || return 1
+  rem=$(( LAG_DEADLINE - $(date +%s) ))
+  [ "$rem" -ge 1 ] || return 1
+  timeout "$rem" find "$LAG_COMMIT_DIR" -maxdepth 1 -type f -mmin +10080 -delete 2>/dev/null || true
+  for c in $commits; do
+    [ "$(date +%s)" -lt "$LAG_DEADLINE" ] || return 1
+    if names="$(lag_commit_read "$c")"; then
+      [ "$names" != capped ] || return 1
+      [ -z "$names" ] || printf '%s\n' "$names"
+      continue
+    fi
+    rem=$(( LAG_DEADLINE - $(date +%s) ))
+    [ "$rem" -ge 5 ] || return 1
+    [ "$rem" -le 20 ] || rem=20
+    # One line per file, so the per-commit cap counts files, not names. gh
+    # prints nothing, successfully, for a body its --jq never ran on (an empty
+    # 204), on any page, so each validated page also emits a tab-free
+    # "#page <files>" line that no @tsv file line can equal. The list is
+    # complete only when every page but the last is full and the last is short;
+    # a commit whose file count is an exact multiple of the page size therefore
+    # refuses rather than being trusted.
+    listed="$(timeout "$rem" gh api --paginate "repos/$REPO/commits/$c?per_page=$LAG_PAGE_SIZE" \
+      --jq 'if (.files | type) == "array"
+               and all(.files[]; (.filename | type) == "string" and (.filename | length) > 0
+                 and ((.previous_filename // "") | type) == "string"
+                 and (.status != "renamed" or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))
+             then "#page \(.files | length)", (.files[] | [.filename, (.previous_filename // "")] | @tsv)
+             else error("malformed commit") end' 2>/dev/null)" || return 1
+    if [ "$(printf '%s\n' "$listed" | grep -v '^#page [0-9]*$' | grep -c . || true)" -ge 3000 ]; then
+      lag_commit_write "$c" capped ""
+      return 1
+    fi
+    printf '%s\n' "$listed" | awk -v size="$LAG_PAGE_SIZE" '
+      /^#page [0-9]+$/ { if (pages++ && last != size) bad = 1; last = $2 + 0 }
+      END { exit !(pages > 0 && !bad && last < size) }' || return 1
+    listed="$(printf '%s\n' "$listed" | grep -v '^#page [0-9]*$' || true)"
+    names="$(printf '%s' "$listed" | tr '\t' '\n' | grep . || true)"
+    lag_commit_write "$c" "$(printf '%s' "$names" | grep -c . || true) $(printf '%s' "$names" | sha256sum | cut -c1-64)" "$names"
+    [ -z "$names" ] || printf '%s\n' "$names"
+  done
+  [ "$(date +%s)" -lt "$LAG_DEADLINE" ] || return 1
+  return 0
+}
 deploy_lag_safe() {
-  local deployed="$1" paths="$2" out status behind files hits
+  local deployed="$1" paths="$2" out status behind files names raw hits
   [ -n "$paths" ] || { printf 'false'; return; }
   out="$(timeout 10 gh api "repos/$REPO/compare/$deployed...$SOURCE_SHA" 2>/dev/null)" || { printf 'false'; return; }
   status="$(jq -r '.status // empty' <<<"$out" 2>/dev/null)"
@@ -1619,14 +1713,22 @@ deploy_lag_safe() {
   [ "$status" = "ahead" ] && [ "$behind" = "0" ] || { printf 'false'; return; }
   files="$(jq -r '.files | length' <<<"$out" 2>/dev/null)"
   printf '%s' "$files" | grep -Eq '^[0-9]+$' || { printf 'false'; return; }
-  [ "$files" -lt 300 ] || { printf 'false'; return; }
+  if [ "$files" -lt 300 ]; then
+    names="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$out" 2>/dev/null)" || { printf 'false'; return; }
+  else
+    raw="$(lag_range_files "$out")" || { printf 'false'; return; }
+    names="$(jq -Rsc 'split("\n") | map(select(length > 0))' <<<"$raw" 2>/dev/null)" || { printf 'false'; return; }
+  fi
   hits="$(jq -r --arg p "$paths" '
-    [ .files[].filename ] as $files
+    . as $files
     | ($p | split(",")) as $pre
-    | [ $files[] as $f | $pre[] as $x | select($f | startswith($x)) ] | length' <<<"$out" 2>/dev/null)"
+    | [ $files[] as $f | $pre[] as $x | select($f | startswith($x)) ] | length' <<<"$names" 2>/dev/null)"
   printf '%s' "$hits" | grep -Eq '^[0-9]+$' || { printf 'false'; return; }
   if [ "$hits" -eq 0 ]; then printf 'true'; else printf 'false'; fi
 }
+# One budget for every rebuild in this run (both services share it): the calls
+# below run in subshells, so the deadline is fixed here, once.
+LAG_DEADLINE=$(( $(date +%s) + LAG_BUDGET_SECONDS ))
 
 DEPLOY_READY=false
 BACKEND_LAG_ACCEPTED=false
