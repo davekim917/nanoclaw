@@ -300,8 +300,8 @@ export interface SelfHealDeps {
   /** Returns false on failure. */
   createTask?: (input: SelfHealTaskInput) => Promise<boolean>;
   resolveThreadUrl?: (threadId: string) => Promise<string | null>;
-  /** Whether the owner still has a session working the claim's thread; null owner means any agent in the workgroup. */
-  isOwnerLive?: (workgroupId: string, claim: BoardClaim, ownerAgentGroupId: string | null, now: number) => Promise<boolean>;
+  /** Whether the owner still has a session working the claim's thread. */
+  isOwnerLive?: (workgroupId: string, claim: BoardClaim, ownerAgentGroupId: string, now: number) => Promise<boolean>;
   enabled?: boolean;
   takeoverEnabled?: boolean;
 }
@@ -547,7 +547,7 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
 async function defaultIsOwnerLive(
   workgroupId: string,
   claim: BoardClaim,
-  ownerAgentGroupId: string | null,
+  ownerAgentGroupId: string,
   now: number,
 ): Promise<boolean> {
   const [{ getDb }, { isTaskThread }] = await Promise.all([
@@ -559,13 +559,11 @@ async function defaultIsOwnerLive(
     `SELECT s.id AS id
        FROM sessions s
        JOIN agent_groups ag ON ag.id = s.agent_group_id
-      WHERE ag.workgroup_id = ? AND s.thread_id = ? AND s.status = 'active'
-        AND (? IS NULL OR s.agent_group_id = ?)
+      WHERE ag.workgroup_id = ? AND s.thread_id = ? AND s.status = 'active' AND s.agent_group_id = ?
         AND (s.container_status = 'running' OR datetime(s.last_outbound_at) >= datetime(?))
       LIMIT 1`,
     workgroupId,
     claim.threadId,
-    ownerAgentGroupId,
     ownerAgentGroupId,
     new Date(now - LIVE_OWNER_OUTBOUND_WINDOW_MS).toISOString(),
   );
@@ -684,8 +682,9 @@ async function applyDecision(args: {
   // A claim past its TTL whose owner is still at work is a TTL that ran short, not abandoned work: asking anyone to
   // move or take it would hand live work to a second session. Spends no rung, so the ladder resumes once it goes quiet.
   if (
+    owner &&
     (decision.action === 'nudge' || decision.action === 'takeover') &&
-    (await args.isOwnerLive(workgroupId, claim, owner?.agentGroupId ?? null, now))
+    (await args.isOwnerLive(workgroupId, claim, owner.agentGroupId, now))
   ) {
     log.info('self-heal: owner still working the claim thread, leaving it', { class: 'stale-claim', ...base });
     return { ...base, applied: false, reason: 'owner-live' };

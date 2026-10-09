@@ -651,6 +651,29 @@ describe('a claim whose owning session is still working', () => {
     expect(d.sent).toHaveLength(1);
   });
 
+  it('keeps the one-a-day unresolved backoff when the owner is unresolvable and a sibling works the thread', async () => {
+    await createAgentGroup({ id: 'ag-sib', name: 'bo', folder: 'bo', agent_provider: null, created_at: iso(-HOUR) });
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-a' WHERE id = 'ag-sib'`);
+    await createSession({
+      id: 'sess-sib',
+      agent_group_id: 'ag-sib',
+      messaging_group_id: null,
+      thread_id: THREAD,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: iso(-5 * 60 * 1000),
+      created_at: iso(-30 * HOUR),
+    });
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { isOwnerLive: undefined, resolveOwner: async () => null });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'nudge', applied: false, reason: 'owner-unresolved' });
+    expect(readClaimFile(dir, 'seam').auto_heal_unresolved_at).toBe(new Date(NOW).toISOString());
+  });
+
   it('nudges as before once the owner has gone quiet', async () => {
     await ownerSession('stopped', iso(-3 * HOUR));
     const dir = root({ seam: claim(30) });
