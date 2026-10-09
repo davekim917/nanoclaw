@@ -45,8 +45,8 @@ import { ROUTE_CHECK_DELIVER_BY_MS } from './thread-route-verdict.js';
 import { askJev, JEV_MODEL, type JevAnswer } from './typesafe.js';
 import Database from 'better-sqlite3';
 
-/** Sanitized from the live misroute; `request`/`response` are a live jev-1.13.0 exchange recorded off CI. */
-const replay = JSON.parse(fs.readFileSync('src/test-fixtures/thread-route-replay-oct08.json', 'utf8')) as {
+/** Fictional data in the shape of a live misroute; `request`/`response` are a live jev-1.13.0 exchange recorded off CI. */
+const replay = JSON.parse(fs.readFileSync('src/test-fixtures/thread-route-replay.json', 'utf8')) as {
   postText: string;
   channelType: string;
   platformId: string;
@@ -114,8 +114,8 @@ function archiveThread(threadId: string, replies: number, lastAt = now()): void 
     threadId: null,
     role: 'user',
     senderId: null,
-    senderName: 'Dave',
-    text: `Plan the monthly bonus calculation automation (${threadId})`,
+    senderName: 'Morgan',
+    text: `Plan the weekly shift roster automation (${threadId})`,
     sentAt: new Date(last - (replies + 1) * 60_000).toISOString(),
   });
   for (let i = 0; i < replies; i++) {
@@ -129,8 +129,8 @@ function archiveThread(threadId: string, replies: number, lastAt = now()): void 
       threadId: `${PID}:${threadId}`,
       role: 'user',
       senderId: null,
-      senderName: 'Axie',
-      text: `bonus plan step ${i}`,
+      senderName: 'Wren',
+      text: `roster plan step ${i}`,
       sentAt: new Date(last - (replies - 1 - i) * 60_000).toISOString(),
     });
   }
@@ -191,7 +191,7 @@ function recordingAdapter(): Array<{ threadId: string | null }> {
   setDeliveryAdapter({
     async deliver(_ct, _pid, threadId) {
       calls.push({ threadId });
-      return `90000000000000000${calls.length}`;
+      return String(123456789000000000n + BigInt(calls.length));
     },
   });
   return calls;
@@ -243,22 +243,22 @@ describe('routing check — scope', () => {
 
 describe('routing check — check points a and c (continue_thread adoption)', () => {
   it('an adopted thread scoring below the threshold is not adopted: the key opens a new thread, stored and noticed', async () => {
-    archiveThread('thr-commissions', 3);
+    archiveThread('thr-roster', 3);
     scores(0.11);
     const session = await fireSession();
-    insertPost(session.id, 'out-1', handoff('Bonus error ask', 'lb-dm-1', { continueThread: 'thr-commissions' }));
+    insertPost(session.id, 'out-1', handoff('Oven repair ask', 'lb-dm-1', { continueThread: 'thr-roster' }));
     const calls = recordingAdapter();
 
     await deliverUntilSettled(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-1', thread_platform_id: '900000000000000001' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'lb-dm-1', thread_platform_id: '123456789000000001' }]);
     expect(await checkRows()).toEqual([
       {
         message_out_id: 'out-1',
         thread_key: 'lb-dm-1',
         check_point: 'a',
-        candidate_thread_id: 'thr-commissions',
+        candidate_thread_id: 'thr-roster',
         score: 0.11,
         threshold: 0.35,
         decision: 'veto',
@@ -268,8 +268,8 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
       },
     ]);
     expect(noticeOf(session.id, 'out-1')).toBe(
-      'ROUTING CHECK VETO: continue_thread thr-commissions is not working on this request (routing check score 0.11 ' +
-        'is below 0.35). This post opened a NEW thread: https://discord.com/channels/111/900000000000000001. Keep ' +
+      'ROUTING CHECK VETO: continue_thread thr-roster is not working on this request (routing check score 0.11 ' +
+        'is below 0.35). This post opened a NEW thread: https://discord.com/channels/111/123456789000000001. Keep ' +
         'using thread_key "lb-dm-1" for this request; it now points at the new thread.',
     );
   });
@@ -278,7 +278,7 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
     archiveThread('thr-live', 3);
     scores(0.35);
     const session = await fireSession();
-    insertPost(session.id, 'out-1', handoff('Same pilot, names attached', 'lb-dm-2', { continueThread: 'thr-live' }));
+    insertPost(session.id, 'out-1', handoff('Same trial, names attached', 'lb-dm-2', { continueThread: 'thr-live' }));
     const calls = recordingAdapter();
 
     await deliverUntilSettled(session);
@@ -293,7 +293,7 @@ describe('routing check — check points a and c (continue_thread adoption)', ()
     archiveThread('thr-old', 2, agoIso(3 * 24 * 60 * 60 * 1000));
     scores(0.25);
     const session = await fireSession();
-    insertPost(session.id, 'out-1', handoff('Channel revenue ask', 'lb-dm-3', { continueThread: 'thr-old' }));
+    insertPost(session.id, 'out-1', handoff('Supplier invoice ask', 'lb-dm-3', { continueThread: 'thr-old' }));
     const calls = recordingAdapter();
 
     await deliverUntilSettled(session);
@@ -318,14 +318,14 @@ describe("routing check — check point b (a post into the key's own earlier thr
     expect(calls).toEqual([{ threadId: null }]);
     expect(await keyRows()).toEqual([
       { thread_key: 'lb-dm-b', thread_platform_id: 'thr-earlier' },
-      { thread_key: split, thread_platform_id: '900000000000000001' },
+      { thread_key: split, thread_platform_id: '123456789000000001' },
     ]);
     expect(await checkRows()).toMatchObject([
       { check_point: 'b', candidate_thread_id: 'thr-earlier', decision: 'veto', split_thread_key: split },
     ]);
     expect(noticeOf(session.id, 'out-1')).toBe(
       'ROUTING CHECK VETO: thread thr-earlier is not working on this request (routing check score 0.03 is below 0.35). ' +
-        'This post opened a NEW thread: https://discord.com/channels/111/900000000000000001. Its thread_key is ' +
+        'This post opened a NEW thread: https://discord.com/channels/111/123456789000000001. Its thread_key is ' +
         `"${split}". Use thread_key "${split}" for this request's topic file, its dispatch and every later post about ` +
         'it. Thread_key "lb-dm-b" stays with the earlier request.',
     );
@@ -343,7 +343,7 @@ describe("routing check — check point b (a post into the key's own earlier thr
     });
     await deliverUntilSettled(session);
 
-    expect(calls.slice(1)).toEqual([{ threadId: `${PID}:thr-earlier` }, { threadId: `${PID}:900000000000000001` }]);
+    expect(calls.slice(1)).toEqual([{ threadId: `${PID}:thr-earlier` }, { threadId: `${PID}:123456789000000001` }]);
     expect(jev).toHaveBeenCalledTimes(1);
   });
 
@@ -424,7 +424,7 @@ describe('routing check — any failure opens a new thread', () => {
     expect(calls).toEqual([{ threadId: null }]);
     expect(await keyRows()).toEqual([
       { thread_key: 'lb-dm-x', thread_platform_id: 'thr-prior' },
-      { thread_key: 'lb-dm-x.split-out-1', thread_platform_id: '900000000000000001' },
+      { thread_key: 'lb-dm-x.split-out-1', thread_platform_id: '123456789000000001' },
     ]);
     expect(noticeOf(session.id, 'out-1')).toContain(`the routing check failed (${error}`);
     expect(jev).toHaveBeenCalledTimes(jevCalled ? 1 : 0);
@@ -480,7 +480,7 @@ describe('routing check — any failure opens a new thread', () => {
     setDeliveryAdapter({
       async deliver(_ct, _pid, _threadId, _kind, content) {
         sent.push((JSON.parse(content) as { text: string }).text);
-        return `90000000000000000${sent.length}`;
+        return String(123456789000000000n + BigInt(sent.length));
       },
     });
 
@@ -507,7 +507,7 @@ describe('routing check — any failure opens a new thread', () => {
       async deliver(_ct, _pid, threadId) {
         calls.push(threadId);
         if (calls.length === 1) throw new Error('platform hiccup');
-        return '900000000000000009';
+        return '123456789000000009';
       },
     });
 
@@ -518,7 +518,7 @@ describe('routing check — any failure opens a new thread', () => {
     expect(await checkRows()).toHaveLength(1);
     expect(await keyRows()).toContainEqual({
       thread_key: 'lb-dm-x.split-out-1',
-      thread_platform_id: '900000000000000009',
+      thread_platform_id: '123456789000000009',
     });
   });
 
@@ -552,28 +552,28 @@ describe('routing check — what Jev is asked', () => {
       sentAt: new Date(Date.UTC(2026, 9, 8, 12, i)).toISOString(),
     });
     const messages = [
-      msg('t1:sibling', 'Dave', `Open   ask\n${'o'.repeat(300)}`, 0),
-      ...[1, 2, 3, 4, 5].map((i) => msg(`r${i}`, i % 2 ? 'Axie' : 'Dave', `reply ${i}`, i)),
+      msg('t1:sibling', 'Morgan', `Open   ask\n${'o'.repeat(300)}`, 0),
+      ...[1, 2, 3, 4, 5].map((i) => msg(`r${i}`, i % 2 ? 'Wren' : 'Morgan', `reply ${i}`, i)),
       msg('host-copy', 'assistant', 'the host copy of reply 5', 6),
-      msg('r6', 'Dave', `token ${token} ${'x'.repeat(400)}`, 7),
+      msg('r6', 'Morgan', `token ${token} ${'x'.repeat(400)}`, 7),
     ];
 
     expect(threadView('t1', messages)).toEqual({
-      opened_by: 'Dave',
+      opened_by: 'Morgan',
       opening_message: `Open ask ${'o'.repeat(231)}...`,
       message_count: 8,
       latest_messages: [
-        { from: 'Dave', text: 'reply 2' },
-        { from: 'Axie', text: 'reply 3' },
-        { from: 'Dave', text: 'reply 4' },
-        { from: 'Axie', text: 'reply 5' },
-        { from: 'Dave', text: `token [REDACTED] ${'x'.repeat(283)}...` },
+        { from: 'Morgan', text: 'reply 2' },
+        { from: 'Wren', text: 'reply 3' },
+        { from: 'Morgan', text: 'reply 4' },
+        { from: 'Wren', text: 'reply 5' },
+        { from: 'Morgan', text: `token [REDACTED] ${'x'.repeat(283)}...` },
       ],
     });
     expect(threadView('t1', messages.slice(0, 1))).not.toHaveProperty('latest_messages');
   });
 
-  it('replays the 2026-10-08 misroute: its opening post into thread 1557445336749052006 is vetoed', async () => {
+  it('replays a misroute: a new request posted into a thread about another request from the same person is vetoed', async () => {
     const req: RouteCheckRequest = {
       via: 'adopt',
       threadKey: 'lb-slack-dm-replay',
@@ -599,7 +599,7 @@ describe('routing check — what Jev is asked', () => {
     });
 
     expect(ask).toHaveBeenCalledTimes(1);
-    expect(verdict).toEqual({ keep: false, checkPoint: 'a', score: 0.05, error: null });
+    expect(verdict).toEqual({ keep: false, checkPoint: 'a', score: 0.03, error: null });
   });
 
   it.each<[string, Record<string, JevAnswer>, string | null]>([
@@ -607,7 +607,7 @@ describe('routing check — what Jev is asked', () => {
     ['out of range', { same_request: { type: 'noul', noul: 1.2 } }, 'malformed Jev answer'],
     ['missing', {}, 'malformed Jev answer'],
   ])('a score %s is a veto', async (_label, answers, error) => {
-    const opener: ArchivedThreadMessage = { id: 'thr-x:sibling', senderName: 'Dave', text: 'opener', sentAt: now() };
+    const opener: ArchivedThreadMessage = { id: 'thr-x:sibling', senderName: 'Morgan', text: 'opener', sentAt: now() };
     const verdict = await checkThreadRoute(
       {
         via: 'anchor',
