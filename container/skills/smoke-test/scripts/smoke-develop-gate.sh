@@ -1663,6 +1663,7 @@ lag_range_files() {
     then .commits[].sha else error("range") end' <<<"$out" 2>/dev/null)" || return 1
   find "$LAG_COMMIT_DIR" -maxdepth 1 -type f -mmin +10080 -delete 2>/dev/null || true
   for c in $commits; do
+    [ "$(date +%s)" -lt "$LAG_DEADLINE" ] || return 1
     if names="$(lag_commit_read "$c")"; then
       [ "$names" != capped ] || return 1
       [ -z "$names" ] || printf '%s\n' "$names"
@@ -1671,9 +1672,19 @@ lag_range_files() {
     rem=$(( LAG_DEADLINE - $(date +%s) ))
     [ "$rem" -ge 5 ] || return 1
     [ "$rem" -le 20 ] || rem=20
-    # One line per file, so the per-commit cap counts files, not names.
+    # One line per file, so the per-commit cap counts files, not names. gh
+    # prints nothing, successfully, for a body its --jq never ran on (an empty
+    # 204), so each validated page also emits a tab-free marker line that no
+    # @tsv file line can equal; no marker means no evidence.
     listed="$(timeout "$rem" gh api --paginate "repos/$REPO/commits/$c?per_page=100" \
-      --jq '.files[] | [.filename, (.previous_filename // "")] | @tsv' 2>/dev/null)" || return 1
+      --jq 'if (.files | type) == "array"
+               and all(.files[]; (.filename | type) == "string" and (.filename | length) > 0
+                 and ((.previous_filename // "") | type) == "string"
+                 and (.status != "renamed" or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))
+             then "#page", (.files[] | [.filename, (.previous_filename // "")] | @tsv)
+             else error("malformed commit") end' 2>/dev/null)" || return 1
+    case "$listed" in '#page'*) ;; *) return 1 ;; esac
+    listed="$(printf '%s\n' "$listed" | grep -v '^#page$' || true)"
     if [ "$(printf '%s' "$listed" | grep -c . || true)" -ge 3000 ]; then
       lag_commit_write "$c" capped ""
       return 1
