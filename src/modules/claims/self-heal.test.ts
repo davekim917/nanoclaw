@@ -24,6 +24,7 @@ import {
 } from './self-heal.js';
 import { readClaims } from '../../claims-board.js';
 import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
+import { createAgentGroup, createSession, getDb, initMigratedTestDb } from '../../db/index.js';
 import { log } from '../../log.js';
 
 // Only needed by the one test that exercises the REAL createTask path; the rest
@@ -133,6 +134,7 @@ function deps(dir: string, over: Partial<SelfHealDeps> = {}): SelfHealDeps & { s
       return true;
     }),
     resolveThreadUrl: vi.fn(async () => null),
+    isOwnerLive: vi.fn(async () => false),
     sent,
     ...over,
   };
@@ -457,7 +459,7 @@ describe('anti-noise — a nudge must produce work, not chat', () => {
   it('tells the agent to post NOTHING when it finishes, releases or parks', () => {
     const prompt = buildNudgePrompt(BOARD_CLAIM, 'x');
 
-    expect(prompt).toContain('Post NOTHING for 1 or 2');
+    expect(prompt).toContain('Post NOTHING for 1, 2 or 4');
     // The clause that produced 22 channel posts in a day.
     expect(prompt).not.toContain('say here');
     expect(prompt).not.toContain('say so here');
@@ -506,6 +508,7 @@ describe('anti-noise — a nudge must produce work, not chat', () => {
       enabled: true,
       resolveOwner: async () => OWNER,
       resolveSibling: async () => SIBLING,
+      isOwnerLive: async () => false,
     });
 
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -547,11 +550,140 @@ describe('prompt builders', () => {
     }
   });
 
+  it('lets a session that is not the owner leave a claim whose owning thread is still working on it', () => {
+    const prompt = buildNudgePrompt(board, 'x');
+    expect(prompt).not.toContain('no fourth option');
+    expect(prompt).toMatch(/4\. .*still being worked in its own thread/);
+    expect(prompt).toContain('leave the claim exactly as it is');
+  });
+
   it('offers takeover only two options, and never "finish it"', () => {
     const prompt = buildTakeoverPrompt(board);
     expect(prompt).toContain('owned by ava');
     expect(prompt).toContain('claim.sh take seam');
     expect(prompt).not.toContain('1. Finish it');
+  });
+});
+
+describe('a claim whose owning session is still working', () => {
+  const THREAD = 'slack:C0AAA:1786621514.008659';
+
+  beforeEach(async () => {
+    await initMigratedTestDb();
+    await getDb().run(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-a', 'A', ?)`, iso(-HOUR));
+    await createAgentGroup({
+      id: OWNER.agentGroupId,
+      name: 'ava',
+      folder: 'ava',
+      agent_provider: null,
+      created_at: iso(-HOUR),
+    });
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-a' WHERE id = ?`, OWNER.agentGroupId);
+  });
+
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  function iso(offsetMs: number): string {
+    return new Date(NOW + offsetMs).toISOString();
+  }
+
+  async function ownerSession(containerStatus: 'running' | 'stopped', lastOutboundAt: string | null): Promise<void> {
+    await createSession({
+      id: 'sess-owner',
+      agent_group_id: OWNER.agentGroupId,
+      messaging_group_id: null,
+      thread_id: THREAD,
+      agent_provider: null,
+      status: 'active',
+      container_status: containerStatus,
+      last_active: iso(-HOUR),
+      created_at: iso(-30 * HOUR),
+    });
+    if (lastOutboundAt)
+      await getDb().run('UPDATE sessions SET last_outbound_at = ? WHERE id = ?', lastOutboundAt, 'sess-owner');
+  }
+
+  it('leaves a stale claim alone, spending no rung, while its owner has a running container in the thread', async () => {
+    await ownerSession('running', null);
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { isOwnerLive: undefined });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ slug: 'seam', action: 'nudge', applied: false, reason: 'owner-live' });
+    expect(d.sent).toEqual([]);
+    expect(readClaimFile(dir, 'seam').auto_nudge_count).toBeUndefined();
+  });
+
+  it('never offers a takeover while the owner posted in the thread within the hour', async () => {
+    await ownerSession('stopped', iso(-20 * 60 * 1000));
+    const dir = root({
+      seam: claim(30, { auto_nudge_count: 2, auto_nudged_at: new Date(NOW - 25 * HOUR).toISOString() }),
+    });
+    const d = deps(dir, { isOwnerLive: undefined });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'takeover', applied: false, reason: 'owner-live' });
+    expect(d.sent).toEqual([]);
+  });
+
+  it('still nudges a task-thread claim whose recurring series is running and posted recently', async () => {
+    await createSession({
+      id: 'sess-series',
+      agent_group_id: OWNER.agentGroupId,
+      messaging_group_id: null,
+      thread_id: 'system:tasks:dispatch-abc',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: iso(-5 * 60 * 1000),
+      created_at: iso(-30 * HOUR),
+    });
+    await getDb().run('UPDATE sessions SET last_outbound_at = ? WHERE id = ?', iso(-10 * 60 * 1000), 'sess-series');
+    const dir = root({ seam: claim(30, { thread_id: 'system:tasks:dispatch-abc' }) });
+    const d = deps(dir, { isOwnerLive: undefined });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'nudge', applied: true });
+    expect(d.sent).toHaveLength(1);
+  });
+
+  it('keeps the one-a-day unresolved backoff when the owner is unresolvable and a sibling works the thread', async () => {
+    await createAgentGroup({ id: 'ag-sib', name: 'bo', folder: 'bo', agent_provider: null, created_at: iso(-HOUR) });
+    await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-a' WHERE id = 'ag-sib'`);
+    await createSession({
+      id: 'sess-sib',
+      agent_group_id: 'ag-sib',
+      messaging_group_id: null,
+      thread_id: THREAD,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: iso(-5 * 60 * 1000),
+      created_at: iso(-30 * HOUR),
+    });
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { isOwnerLive: undefined, resolveOwner: async () => null });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'nudge', applied: false, reason: 'owner-unresolved' });
+    expect(readClaimFile(dir, 'seam').auto_heal_unresolved_at).toBe(new Date(NOW).toISOString());
+  });
+
+  it('nudges as before once the owner has gone quiet', async () => {
+    await ownerSession('stopped', iso(-3 * HOUR));
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { isOwnerLive: undefined });
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ action: 'nudge', applied: true });
+    expect(d.sent).toHaveLength(1);
   });
 });
 
@@ -819,6 +951,22 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
         deliverThreadId: null,
       },
     ]);
+  });
+
+  it('skips a newer anchor in a channel the owner is not wired to', async () => {
+    // A destination grant lets a series post where its agent is not wired; nobody there can be nudged.
+    getRawDb()
+      .prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, NULL, ?, ?)')
+      .run('mg-2', 'slack-example', 'slack:C0BBB', '#channel-b', '2026-08-01T00:00:00Z');
+    anchor('slack-example', 'slack:C0BBB', '2222.0002', '2026-08-21T00:00:00Z');
+    stampRouting('slack:C0AAA', 'slack-example', null);
+
+    const [row] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(row).toMatchObject({ messagingGroupId: 'mg-1', deliverThreadId: null });
+
+    anchor('slack-example', 'slack:C0AAA', '1111.0001', '2026-08-19T00:00:00Z');
+    const [older] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(older).toMatchObject({ messagingGroupId: 'mg-1', deliverThreadId: 'slack:C0AAA:1111.0001' });
   });
 
   it('resolves nothing rather than guessing when the series never posted and never routed', async () => {

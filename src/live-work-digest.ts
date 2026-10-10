@@ -7,8 +7,9 @@
 import { readClaims, type BoardClaim } from './claims-board.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb } from './db/connection.js';
-import { isTaskThread } from './db/sessions.js';
+import { isTaskThread, TASKS_SYSTEM_THREAD_ID } from './db/sessions.js';
 import { log } from './log.js';
+import { resolveTaskSeries } from './modules/claims/task-series-destination.js';
 import { withExistingNanoclawOutboundSync } from './modules/mailbox/index.js';
 import type { TaskListInFlight } from './modules/mailbox/ops/session-state.js';
 import { boundedText } from './modules/memory/pre-turn-context.js';
@@ -16,8 +17,10 @@ import { boundedText } from './modules/memory/pre-turn-context.js';
 export const LIVE_WORK_BOUNDS = Object.freeze({
   /** A list untouched this long reads as abandoned, not in flight. */
   listWindowMs: 24 * 60 * 60 * 1000,
-  /** Session databases opened per digest, most recently active first: the digest is built on every turn. */
-  candidateSessions: 40,
+  /** Sessions with an open list collected per digest, most recently active first. */
+  openListSessions: 40,
+  /** Session databases opened per digest while looking for those lists: the digest is built on every turn. */
+  scannedSessions: 150,
   sessions: 6,
   itemsPerSession: 3,
   claims: 10,
@@ -106,6 +109,7 @@ async function readOpenLists(
         AND s.id != ? AND s.status = 'active' AND s.archived_at IS NULL
         AND (? IS NULL OR s.thread_id IS NOT ?)
         AND (? IS NOT NULL OR ? IS NULL OR NOT (s.thread_id IS NULL AND mg.platform_id IS ?))
+        AND (s.thread_id IS NULL OR (s.thread_id != ? AND substr(s.thread_id, 1, length(?)) != ?))
         AND datetime(COALESCE(s.last_active, s.created_at)) >= datetime(?)
       ORDER BY datetime(COALESCE(s.last_active, s.created_at)) DESC
       LIMIT ?`,
@@ -117,12 +121,19 @@ async function readOpenLists(
     own.threadId,
     own.platformId,
     own.platformId,
+    TASKS_SYSTEM_THREAD_ID,
+    `${TASKS_SYSTEM_THREAD_ID}:`,
+    `${TASKS_SYSTEM_THREAD_ID}:`,
     since,
-    LIVE_WORK_BOUNDS.candidateSessions,
+    LIVE_WORK_BOUNDS.scannedSessions + 1,
   );
   const open: OpenList[] = [];
-  let partial = rows.length >= LIVE_WORK_BOUNDS.candidateSessions;
-  for (const row of rows) {
+  let partial = rows.length > LIVE_WORK_BOUNDS.scannedSessions;
+  for (const row of rows.slice(0, LIVE_WORK_BOUNDS.scannedSessions)) {
+    if (open.length === LIVE_WORK_BOUNDS.openListSessions) {
+      partial = true;
+      break;
+    }
     let list: TaskListInFlight | null | undefined;
     try {
       list = withExistingNanoclawOutboundSync(row.agent_group_id, row.id, (outbound) =>
@@ -163,9 +174,23 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     sessionId,
   );
   const ownThread = own?.thread_id ?? null;
-  const link = async (threadId: string | null) => (threadId && !isTaskThread(threadId) ? linkFor(threadId) : null);
-
   const workgroupId = (await getAgentGroup(agentGroupId))?.workgroup_id ?? null;
+  const link = async (threadId: string | null) => {
+    if (!threadId) return null;
+    if (!isTaskThread(threadId)) return linkFor(threadId);
+    if (!workgroupId) return null;
+    let landsIn: string | null | undefined;
+    try {
+      landsIn = (await resolveTaskSeries(workgroupId, threadId, { inbound: { busyTimeoutMs: 0 } }))?.destination
+        ?.threadId;
+      // eslint-disable-next-line no-catch-all/no-catch-all -- a task claim's link is advisory; one unreadable session must not blank the digest
+    } catch (err) {
+      log.debug('Live work digest: task series destination unreadable, claim left unlinked', { threadId, err });
+      return null;
+    }
+    return landsIn ? linkFor(landsIn) : null;
+  };
+
   const { open: lists, partial } = await readOpenLists(
     agentGroupId,
     workgroupId,
@@ -177,7 +202,7 @@ async function collect(agentGroupId: string, sessionId: string, deps: LiveWorkDe
     sessions.push({
       owner: row.owner,
       self: row.agent_group_id === agentGroupId,
-      channel: row.channel ?? (isTaskThread(row.thread_id) ? 'scheduled task' : null),
+      channel: row.channel,
       threadId: row.thread_id,
       link: await link(row.thread_id),
       title: boundedText(list.title ?? '(untitled list)', LIVE_WORK_BOUNDS.titleChars, CLIPPED),

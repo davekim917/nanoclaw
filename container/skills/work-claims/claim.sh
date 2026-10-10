@@ -204,6 +204,10 @@ cmd_take() {
     echo "REFUSED — $slug is explicitly paused by the operator. Resume only after a new explicit instruction, with --resume." >&2
     exit 3
   fi
+  if [ "$state" = "live" ] && [ "$resume" -eq 1 ]; then
+    echo "REFUSED — $slug is held live by $owner; there is no pause to resume. Have the owning thread pause it." >&2
+    exit 3
+  fi
   if [ "$state" != "paused" ] && [ "$resume" -eq 1 ]; then
     die "--resume applies only to an explicitly paused claim"
   fi
@@ -256,26 +260,27 @@ cmd_release() {
   done
 
   require_workgroup
-  local f owner note claimed_at thread_id
+  local f owner note claimed_at thread_id state holder
   f="$(file_for "$slug")"
   [ -f "$f" ] || { echo "no claim at $slug — nothing to release"; exit 0; }
   owner="$(jq -r '.owner // "unknown"' "$f")"
   note="$(jq -r '.note // ""' "$f")"
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
   thread_id="$(jq -r '.thread_id // empty' "$f")"
+  IFS=$'\t' read -r state holder _ <<<"$(inspect "$f")"
 
-  if [ "$owner" != "$(me)" ]; then
+  if [ "$owner" != "$(me)" ] || [ "$state" = "live" ]; then
     [ -n "$merged_pr" ] || {
-      echo "REFUSED — $slug belongs to $owner. Release only your own claim." >&2
+      echo "REFUSED — $slug belongs to $holder. Release only your own claim." >&2
       echo "If its PR has MERGED, re-run with --merged-pr <n> and the merge is verified here." >&2
       exit 3
     }
     # The skill's one exception. Verified against GitHub, never inferred from a
     # stale timestamp and never taken on the caller's assertion.
-    local state
-    state="$(gh pr view "$merged_pr" --json state -q .state 2>/dev/null || echo UNKNOWN)"
-    [ "$state" = "MERGED" ] || {
-      echo "REFUSED — PR #$merged_pr is $state, not MERGED. Leave $owner's claim alone and escalate." >&2
+    local pr_state
+    pr_state="$(gh pr view "$merged_pr" --json state -q .state 2>/dev/null || echo UNKNOWN)"
+    [ "$pr_state" = "MERGED" ] || {
+      echo "REFUSED — PR #$merged_pr is $pr_state, not MERGED. Leave $owner's claim alone and escalate." >&2
       exit 3
     }
     echo "PR #$merged_pr verified MERGED — clearing $owner's completed claim"
@@ -377,6 +382,12 @@ cmd_pause() {
     echo "REFUSED — $slug belongs to $owner. Only the current owner may record an operator pause." >&2
     exit 3
   fi
+  local state holder
+  IFS=$'\t' read -r state holder _ <<<"$(inspect "$f")"
+  if [ "$state" = "live" ]; then
+    echo "REFUSED — $slug is held live by $holder. Have the owning thread pause it." >&2
+    exit 3
+  fi
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
   ttl_hours="$(jq -r '.ttl_hours // empty' "$f")"
   thread_id="$(jq -r '.thread_id // empty' "$f")"
@@ -420,6 +431,12 @@ cmd_thread() {
   owner="$(jq -r '.owner // "unknown"' "$f")"
   if [ "$owner" != "$(me)" ]; then
     echo "REFUSED — $slug belongs to $owner. Record the thread on your own claim." >&2
+    exit 3
+  fi
+  local state holder
+  IFS=$'\t' read -r state holder _ <<<"$(inspect "$f")"
+  if [ "$state" = "live" ]; then
+    echo "REFUSED — $slug is held live by $holder. Only that session may move its thread." >&2
     exit 3
   fi
   note="$(jq -r '.note // ""' "$f")"

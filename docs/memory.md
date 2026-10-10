@@ -183,8 +183,11 @@ Every pair then contains only the newly relevant evidence delta:
    owning agent group (`self` marks this agent's own) and its thread link,
    under a rule to hold or route a request that overlaps or depends on them.
    The current snapshot is sent on every turn; when nothing is live elsewhere
-   it is sent empty, so a session that was holding sees the hold lift. A scan
-   that hit its session cap or could not read a session is marked `partial`
+   it is sent empty, so a session that was holding sees the hold lift.
+   Scheduled-task sessions keep no task list and are not scanned for one; their
+   work shows through the claim a task run takes, linked to the thread its
+   output lands in. A scan that left a session with a possible open list unread
+   (its list or database caps) or could not read a session is marked `partial`
    and is never rendered as clear.
 
 The rest of the manual canon is not pushed. `index.md` is the map, and the

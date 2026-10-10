@@ -125,11 +125,11 @@ describe('observatoryNudgeHandler', () => {
     expect((await nudge())!.status).toBe(200);
     const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
     expect(prompt).toBe(buildNudgePrompt(CLAIM, 'Pushed forward by Olive Owner via the Observatory'));
-    expect(prompt).toContain('Post NOTHING for 1 or 2');
+    expect(prompt).toContain('Post NOTHING for 1, 2 or 4');
     expect(prompt).not.toContain('say here');
   });
 
-  it('opens with provenance and demands one of exactly three outcomes', async () => {
+  it('opens with provenance and demands a move unless the claim is still being worked in its own thread', async () => {
     claimsAre([CLAIM]);
     expect((await nudge())!.status).toBe(200);
     const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
@@ -137,7 +137,7 @@ describe('observatoryNudgeHandler', () => {
     expect(prompt).toContain(CLAIM.slug);
     expect(prompt).toContain('waiting on a review that never came');
     expect(prompt).toContain('state: stale · 9h past due · owner: ava');
-    expect(prompt).toContain('there is no fourth option');
+    expect(prompt).toContain('MOVE the claim before this task ends, unless option 4 applies');
     expect(prompt).not.toContain('since parked'); // stale claim — "past due" is the honest label
     expect(prompt).toContain(`claim.sh release ${CLAIM.slug}`);
     expect(prompt).toContain('park');

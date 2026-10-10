@@ -89,7 +89,10 @@ export const updateTaskList: McpToolDefinition = {
   },
   async handler(args) {
     if (getTaskSeriesId()) {
-      return err('task lists are for conversations; a scheduled task reports through send_message');
+      return err(
+        'task lists are for conversations; a scheduled task reports through send_message, and takes a work claim ' +
+          '(work-claims skill) so other sessions can see its in-flight work',
+      );
     }
     const input = parseTaskListInput(args);
     if ('error' in input) return err(input.error);

@@ -49,6 +49,46 @@ NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" take acme-pr-733 4 duplicate buil
   && fail "took another session's live claim"
 [ "$(jq -r .note "$CLAIMS_DIR/acme-pr-733.json")" = "publish-gate seam" ] || fail "refused take still wrote"
 
+# 3c. Nor may that other session re-point the claim's thread at itself: that is
+#     how a park refused by 3b was walked around (thread to self, park, thread back).
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" thread acme-pr-733 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours re-pointed the claim's thread"
+[ "$(jq -r .thread_id "$CLAIMS_DIR/acme-pr-733.json")" = "slack:C0AAA:1786621514.008659" ] \
+  || fail "refused thread retarget still wrote"
+NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked from the wrong thread >/dev/null 2>&1 \
+  && fail "another session of yours parked the claim"
+[ "$(jq -r '.status // "live"' "$CLAIMS_DIR/acme-pr-733.json")" = live ] || fail "refused park still wrote"
+
+# 3d. Nor may it release the claim: deleting another session's live work is the
+#     same failure as parking it.
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" release acme-pr-733 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours released the claim"
+jq -e '.note == "publish-gate seam" and .thread_id == "slack:C0AAA:1786621514.008659"' \
+  "$CLAIMS_DIR/acme-pr-733.json" >/dev/null || fail "refused release still wrote"
+
+# 3e. Nor may it walk around 3c through a pause: pause, resume onto its own
+#     thread, park, then point the thread back. Every step is refused.
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" pause acme-pr-733 operator hold >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours paused the claim"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" take acme-pr-733 4 --resume resuming >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours resumed the live claim"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" park acme-pr-733 parked after resume >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours parked the claim after a pause attempt"
+[ "$(NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" thread acme-pr-733 slack:C0AAA:1786621514.008659 >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "another session of yours pointed the thread back"
+jq -e '.note == "publish-gate seam" and .thread_id == "slack:C0AAA:1786621514.008659" and (has("status") | not)' \
+  "$CLAIMS_DIR/acme-pr-733.json" >/dev/null || fail "refused pause walk-around still wrote"
+
+# 3f. Once that claim is stale it is abandoned work, not another session's live
+#     work: the session that picks it up may move its thread.
+bash "$CLAIM" take acme-stale-thread 4 task run died mid-way >/dev/null
+jq '.claimed_at = "2020-01-01T00:00:00Z"' "$CLAIMS_DIR/acme-stale-thread.json" > "$ROOT/t" \
+  && mv "$ROOT/t" "$CLAIMS_DIR/acme-stale-thread.json"
+NANOCLAW_THREAD_ID=$OTHER_THREAD bash "$CLAIM" thread acme-stale-thread >/dev/null \
+  || fail "another thread could not move a stale claim of yours"
+jq -e --arg t "$OTHER_THREAD" '.thread_id == $t' "$CLAIMS_DIR/acme-stale-thread.json" >/dev/null \
+  || fail "thread on a stale claim did not rewrite thread_id"
+
 # 4. A sibling's live claim is refused with exit 3, and the file is untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 stealing it >/dev/null 2>&1 \
   && fail "took a live claim off a sibling"

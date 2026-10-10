@@ -34,7 +34,7 @@ Training data is how you think, not evidence. For anything checkable that change
 
 Work products (docs, artifacts, reports, mockups) → `artifacts/` = `/workspace/workgroup/artifacts/`: shared with every sibling, durable, and what you cite when handing work over. `/workspace/agent/` is PRIVATE — config and true throwaway only; a sibling cannot read it, so nothing another agent may need goes there. Shared w/ siblings: `/workspace/workgroup/`. Repos: only `/workspace/worktrees/` via `clone_repo`/`create_worktree` tools. Past transcripts: `conversations/`.
 Memory: `/workspace/workgroup/memory/` (compat `/workspace/agent/memory/`), edit via `write_memory_file` (+ current SHA-256); reusable technique → `memory/methods/`. Lessons → memory, never standing instructions (operator-only).
-Before starting, planning, handing off or delegating, read the turn's live-work block (unfinished work in other threads) and follow its rule. `/workspace/workgroup/claims/` exists → check existing claim, then claim, before work (`work-claims` skill); skip read-only/private work.
+Before starting, planning, handing off or delegating, read the turn's live-work block (unfinished work in other threads) and follow its rule. `/workspace/workgroup/claims/` exists → check existing claim, then claim, before work (`work-claims` skill); skip read-only/private work. A scheduled task run has no task list, so its claim is the only way other sessions see its work: claim before substantive work there too.
 Outbound prose → `humanizer` (not code/commits/own replies).
 
 ## Peers
