@@ -72,7 +72,7 @@ permissions: {}
 jobs:
   provenance:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     permissions:
       contents: read
       pull-requests: read
@@ -96,7 +96,7 @@ jobs:
 
   sweep:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     # Contents read only: sweep-main-activity.sh calls only the Activity API, which
     # GitHub's permissions-required-for-github-apps reference lists under Contents —
     # unlike `provenance`, it never calls the PR-link endpoint, so no pull-requests
@@ -116,7 +116,7 @@ jobs:
 
   gate-audit:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     # One audit per pushed commit at a time, so a re-run waits for the run before it and
     # the two can't both file the same PR's issue before either sees the other's. Keyed
     # on the commit: a group keeps only one pending run and cancels it for the next
@@ -151,7 +151,7 @@ jobs:
   gate-audit-sweep:
     # Main's copy of gate-audit.sh only, never an unmerged branch's (see the header).
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     # One sweep at a time, so a scheduled and a dispatched sweep can't both file the
     # same PR's issue; gate-audit.sh also closes a duplicate that gets through.
     concurrency:

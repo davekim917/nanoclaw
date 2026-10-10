@@ -80,6 +80,22 @@ Channel recovery is an adapter contract rather than a Discord special case. Befo
 
 A failure here does **not** fail a PR by itself: this workflow runs nightly on `main` and on demand. A red nightly opens or updates the issue "Nightly CI is red on main" (the `report` job, schedule runs only), to be fixed forward the same day. A PR is blocked only by its own `CI` typecheck run and, if someone dispatched `CI full` on that PR head (`gh workflow run ci-full.yml --ref <branch>`), by that run — the merge gate reads a red or unfinished run on the head as blocking. Everything else is the author's local test run before pushing (CLAUDE.md, Development).
 
+### Self-hosted CI runners
+
+Every workflow job targets `runs-on: [self-hosted, nanoclaw]`: two runners on the production host, so the repo's CI costs no GitHub-hosted minutes. They live outside the repo, in host config:
+
+- **User:** `ghrunner`, a system user with no login shell, no sudo and no `docker` group. Its home and the runner installs are under `/opt/gh-runner/` (`r1`, `r2`).
+- **Service:** `gh-runner@.service` (`gh-runner@r1`, `gh-runner@r2`). It runs `run.sh` with `ProtectHome=yes`, so a job cannot read `/home/ubuntu`, plus `ProtectSystem=full`, `NoNewPrivileges`, `Nice=10` and idle IO.
+- **Slice:** `gh-runner.slice` caps both runners together at 4 CPUs (`CPUQuota=400%`), `MemoryMax=16G` and `CPUWeight`/`IOWeight` 10, so a nightly suite cannot starve the agent fleet.
+
+To re-register a runner (for example after the host is rebuilt), fetch a token with `gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token -q .token`, then run as `ghrunner`:
+
+```
+/opt/gh-runner/<rN>/config.sh --unattended --replace --url https://github.com/<owner>/<repo> --token <token> --name nanoclaw-host-<rN> --labels nanoclaw --work _work
+```
+
+Then start it with `sudo systemctl enable --now gh-runner@<rN>`. A job needing a tool the host lacks fails on the runner; install it host-wide rather than widening the runner's privileges.
+
 ## Test hermeticity
 
 Unit tests on both trees run behind a tripwire that records and reports any call

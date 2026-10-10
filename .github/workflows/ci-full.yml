@@ -33,10 +33,10 @@ permissions:
 # telling the two kinds of red apart, not tolerating either.
 jobs:
   correctness:
-    runs-on: ubuntu-latest
-    # A wedged test otherwise runs to GitHub's 360-minute default; p90 for
-    # this job is 23 min (2026-09-17).
-    timeout-minutes: 45
+    runs-on: [self-hosted, nanoclaw]
+    # A wedged test otherwise runs to GitHub's 360-minute default. Under
+    # gh-runner.slice's 4-CPU cap the host tests alone took 40 min (2026-10-10).
+    timeout-minutes: 75
     steps:
       # fetch-depth: 0 (full history), not actions/checkout@v4's default depth-1
       # shallow clone. scripts/review-notes.test.ts's citation checker resolves
@@ -301,7 +301,7 @@ jobs:
           retention-days: 14
 
   bookkeeping:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
@@ -359,7 +359,7 @@ jobs:
   report:
     needs: [correctness, bookkeeping]
     if: failure() && github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     permissions:
       contents: read
       issues: write
