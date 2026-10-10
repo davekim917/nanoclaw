@@ -145,7 +145,9 @@ describe('F-6.1', () => {
     mockDispatch.mockClear();
     vi.useFakeTimers();
     // 30h stale, well past the 4h ttl + 2h grace, and stays stale for the
-    // whole 24h+ span these ticks cover.
+    // whole 24h+ span these ticks cover. The owner's session in the claim's
+    // thread (below) is stopped and last posted 30h ago, so the owner-live
+    // gate lets every rung through.
     writeClaim(NOW - 30 * HOUR);
 
     await initTestDb();
@@ -163,9 +165,16 @@ describe('F-6.1', () => {
         id TEXT PRIMARY KEY, messaging_group_id TEXT NOT NULL, agent_group_id TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+        thread_id TEXT, status TEXT DEFAULT 'active', container_status TEXT,
+        last_outbound_at TEXT, created_at TEXT NOT NULL
+      );
       INSERT INTO agent_groups VALUES ('ag-1', 'agent-a', 'agent-a', 'claude', 'wg-a', '2026-08-01T00:00:00Z');
       INSERT INTO messaging_groups VALUES ('mg-1', 'slack-example', 'slack:C0AAA', NULL, '#channel-a', '2026-08-01T00:00:00Z');
       INSERT INTO messaging_group_agents VALUES ('w-1', 'mg-1', 'ag-1', '2026-08-01T00:00:00Z');
+      INSERT INTO sessions VALUES ('sess-1', 'ag-1', 'mg-1', 'slack:C0AAA:1786621514.008659', 'active', 'stopped',
+        '2026-08-19T06:00:00.000Z', '2026-08-01T00:00:00Z');
     `);
   });
 

@@ -110,9 +110,16 @@ function mockWorktreeCleanupDeps(
   logMock: Record<string, ReturnType<typeof vi.fn>>,
   dataDir = '/tmp/host-lifecycle-timers-test',
 ): void {
-  vi.doMock('./config.js', () => ({
+  // The six modules' import graph reaches chat-sdk-bridge.ts, which reads
+  // config constants at import time, so the real module is spread and only
+  // the checkout-rooted paths are redirected into the test-owned dir.
+  vi.doMock('./config.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('./config.js')>()),
     DATA_DIR: dataDir,
     GROUPS_DIR: `${dataDir}/groups`,
+    STORE_DIR: `${dataDir}/store`,
+    CENTRAL_DB_PATH: `${dataDir}/v2.db`,
+    REPO_ROOT: dataDir,
   }));
   vi.doMock('./container-runner.js', () => ({ isContainerRunning: () => false, isContainerSpawning: () => false }));
   vi.doMock('./db/connection.js', () => ({ getRawDb: () => ({ prepare: () => ({ all: () => [] }) }) }));
