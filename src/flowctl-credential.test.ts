@@ -11,7 +11,7 @@ describe('resolveFlowctlToken', () => {
 
   it.each([
     ['an explicit flowctl tool and the folder-scoped key', ['hex', 'flowctl'], 'madison-reed', 'mr-key'],
-    ['a scoped flowctl tool entry', ['flowctl:mr'], 'madison-reed', 'mr-key'],
+    ['a scoped flowctl tool entry', ['flowctl:mr'], 'madison-reed', undefined],
     // An absent `tools` list means "every tool" elsewhere; a write-capable Estuary key must not ride on that.
     ['no tools list at all', undefined, 'madison-reed', undefined],
     ['a tools list without flowctl', ['hex'], 'madison-reed', undefined],

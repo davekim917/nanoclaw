@@ -7,7 +7,7 @@
 export const FLOWCTL_NO_PROXY_HOSTS = ['estuary.dev', 'estuary-data.com', 'eyrcnmuzzyriypdajwdk.supabase.co'];
 
 export function flowctlDeclared(tools: string[] | undefined): boolean {
-  return tools?.some((t) => t === 'flowctl' || t.startsWith('flowctl:')) ?? false;
+  return tools?.includes('flowctl') ?? false;
 }
 
 export function flowctlTokenEnvName(credentialFolder: string): string {
