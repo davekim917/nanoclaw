@@ -21,7 +21,11 @@ vi.mock('./log.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, initMigratedTestDb } from './db/index.js';
-import { CLAUDE_MAX_CONCURRENT_SUBAGENTS, CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH } from './claude-spawn-defaults.js';
+import {
+  CLAUDE_MAX_CONCURRENT_SUBAGENTS,
+  CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
+  CLAUDE_SUBAGENT_PROMPT_CACHE_TTL,
+} from './claude-spawn-defaults.js';
 import { initGroupFilesystem } from './group-init.js';
 import type { AgentGroup } from './types.js';
 
@@ -87,6 +91,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     const fresh = JSON.parse(fs.readFileSync(file, 'utf-8'));
     expect(fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
     expect(fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
+    expect(fresh.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe(CLAUDE_SUBAGENT_PROMPT_CACHE_TTL);
     expect(fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
     expect(fresh.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
 
@@ -94,6 +99,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     // that disagree with the spawn `-e`.
     fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '5';
     fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '20';
+    fresh.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL = '5m';
     fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = '1000000';
     // Every group initialized before 2026-09-19 carries this, because
     // REQUIRED_ENV pinned it. Removing it from REQUIRED_ENV alone would leave
@@ -107,6 +113,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
     expect(after.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
     expect(after.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
+    expect(after.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe(CLAUDE_SUBAGENT_PROMPT_CACHE_TTL);
     expect(after.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
     expect(after.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
   });

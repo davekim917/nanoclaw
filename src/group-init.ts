@@ -1,7 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 
-import { CLAUDE_MAX_CONCURRENT_SUBAGENTS, CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH } from './claude-spawn-defaults.js';
+import {
+  CLAUDE_MAX_CONCURRENT_SUBAGENTS,
+  CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
+  CLAUDE_SUBAGENT_PROMPT_CACHE_TTL,
+} from './claude-spawn-defaults.js';
 import { DATA_DIR, DEFAULT_AGENT_PROVIDER, GROUPS_DIR } from './config.js';
 import { stageGroupPersona, STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import { log } from './log.js';
@@ -19,6 +23,7 @@ const REQUIRED_ENV: Record<string, string> = {
   // Fleet constants, so pinning them is safe and stops a hand-edited settings.json shadowing the spawn `-e`.
   CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
   CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: CLAUDE_MAX_CONCURRENT_SUBAGENTS,
+  CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: CLAUDE_SUBAGENT_PROMPT_CACHE_TTL,
 };
 
 // Scrubbed from existing settings.json. Spawn-env-only keys are here because a settings.json pin is a group-level

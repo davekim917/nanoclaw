@@ -190,6 +190,8 @@ describe('claudeSpawnEnv', () => {
       '-e',
       'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=5',
       '-e',
+      'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h',
+      '-e',
       'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
     ]);
   });
@@ -210,9 +212,10 @@ describe('claudeSpawnEnv', () => {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
+      CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
       CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1',
     });
-    expect(env).toHaveLength(18);
+    expect(env).toHaveLength(20);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {

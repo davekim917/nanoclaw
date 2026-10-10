@@ -118,7 +118,7 @@ const BOARD_CLAIM = {
 };
 
 const OWNER = { agentGroupId: 'ag-owner', messagingGroupId: 'mg-1', name: 'ava' };
-const SIBLING = { agentGroupId: 'ag-sib', messagingGroupId: 'mg-1', name: 'bo' };
+const SIBLING = { agentGroupId: 'ag-sib', messagingGroupId: 'mg-1', name: 'sib' };
 
 /** Fully resolvable targets + a recording createTask. Flags default to armed. */
 function deps(dir: string, over: Partial<SelfHealDeps> = {}): SelfHealDeps & { sent: SelfHealTaskInput[] } {
@@ -653,7 +653,7 @@ describe('a claim whose owning session is still working', () => {
   });
 
   it('keeps the one-a-day unresolved backoff when the owner is unresolvable and a sibling works the thread', async () => {
-    await createAgentGroup({ id: 'ag-sib', name: 'bo', folder: 'bo', agent_provider: null, created_at: iso(-HOUR) });
+    await createAgentGroup({ id: 'ag-sib', name: 'sib', folder: 'sib', agent_provider: null, created_at: iso(-HOUR) });
     await getDb().run(`UPDATE agent_groups SET workgroup_id = 'wg-a' WHERE id = 'ag-sib'`);
     await createSession({
       id: 'sess-sib',
