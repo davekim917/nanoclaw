@@ -34,9 +34,9 @@ permissions:
 jobs:
   correctness:
     runs-on: [self-hosted, nanoclaw]
-    # A wedged test otherwise runs to GitHub's 360-minute default; p90 for
-    # this job is 23 min (2026-09-17).
-    timeout-minutes: 45
+    # A wedged test otherwise runs to GitHub's 360-minute default. Under
+    # gh-runner.slice's 4-CPU cap the host tests alone took 40 min (2026-10-10).
+    timeout-minutes: 75
     steps:
       # fetch-depth: 0 (full history), not actions/checkout@v4's default depth-1
       # shallow clone. scripts/review-notes.test.ts's citation checker resolves
