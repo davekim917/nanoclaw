@@ -23,6 +23,8 @@ export type ClaudeSpawnConfig = Pick<
 export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
 export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
 export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '5';
+/** The CLI defaults everything outside the main conversation (subagents, workflows, helpers) to a 5-minute cache. */
+export const CLAUDE_SUBAGENT_PROMPT_CACHE_TTL = '1h';
 
 export interface ClaudeSpawnDefaults {
   /** Resolved concrete id for NANOCLAW_CLAUDE_MODEL; never lands in ANTHROPIC_DEFAULT_OPUS_MODEL. */
@@ -122,6 +124,8 @@ export function claudeSpawnEnv(
     `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=${CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH}`,
     '-e',
     `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=${CLAUDE_MAX_CONCURRENT_SUBAGENTS}`,
+    '-e',
+    `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=${CLAUDE_SUBAGENT_PROMPT_CACHE_TTL}`,
     '-e',
     'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
   );
