@@ -221,6 +221,25 @@ RUN chmod 0755 /usr/local/bin/hex-wrapper.sh \
     && ln -s /usr/local/bin/hex-wrapper.sh /usr/local/bin/hex \
     && /usr/local/bin/hex-real --version
 
+# Estuary flowctl — upstream publishes a bare x86_64 Linux binary and no
+# .sha256 sidecar, so the pin is the digest GitHub records for the release
+# asset (`gh api repos/estuary/flow/releases/tags/v$V --jq '.assets[] | .name + " " + .digest'`).
+# No arm64 build exists; an arm64 image goes without flowctl rather than
+# failing the whole build.
+ARG FLOWCTL_VERSION=0.6.13
+ARG FLOWCTL_SHA256_amd64=edf66d27761e5688a05200f2935cb86f816b7e52582eaffd1f5aef2f002d27d2
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = amd64 ]; then \
+         curl -fsSL "https://github.com/estuary/flow/releases/download/v${FLOWCTL_VERSION}/flowctl-x86_64-linux" \
+           -o /tmp/flowctl \
+         && echo "$FLOWCTL_SHA256_amd64  /tmp/flowctl" | sha256sum -c - \
+         && install -m 0755 /tmp/flowctl /usr/local/bin/flowctl \
+         && rm -f /tmp/flowctl \
+         && /usr/local/bin/flowctl --version; \
+       else \
+         echo "flowctl: no upstream build for $ARCH, skipping" >&2; \
+       fi
+
 # Chromium path for agent-browser / Playwright / mmdc consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

@@ -170,10 +170,32 @@ function detectSessionStartHook(dir: string): boolean {
   return false;
 }
 
+/**
+ * Every entry's `source` is the repo root, so its plugins are skill lists over one tree. The container's plugin walk
+ * registers a directory only by `.claude-plugin/plugin.json` and never reads a marketplace, so without a root
+ * manifest such a repo reaches Claude groups with no skills at all.
+ */
+function marketplaceIsSelfSourced(marketplacePath: string): boolean {
+  try {
+    const { plugins } = JSON.parse(fs.readFileSync(marketplacePath, 'utf-8')) as { plugins?: unknown };
+    return (
+      Array.isArray(plugins) &&
+      plugins.length > 0 &&
+      plugins.every((p) => {
+        const source = (p as { source?: unknown }).source;
+        return source === './' || source === '.';
+      })
+    );
+  } catch {
+    return false;
+  }
+}
+
 function generateClaudeManifest(dir: string, name: string, dryRun: boolean): boolean {
   const manifestPath = path.join(dir, '.claude-plugin', 'plugin.json');
   const marketplacePath = path.join(dir, '.claude-plugin', 'marketplace.json');
-  if (fs.existsSync(manifestPath) || fs.existsSync(marketplacePath)) return false;
+  if (fs.existsSync(manifestPath)) return false;
+  if (fs.existsSync(marketplacePath) && !marketplaceIsSelfSourced(marketplacePath)) return false;
 
   const manifest: Record<string, unknown> = {
     name,

@@ -93,6 +93,12 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { claudeSpawnEnv } from './claude-spawn-defaults.js';
 import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
+import {
+  FLOWCTL_NO_PROXY_HOSTS,
+  flowctlDeclared,
+  flowctlTokenEnvName,
+  resolveFlowctlToken,
+} from './flowctl-credential.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
 import { containerRunsAsHostUser, planGitHubTokenSpawn, registerGroupTokenRefresher } from './github-token-file.js';
@@ -5023,6 +5029,16 @@ async function buildContainerArgs(
     if (v) args.push('-e', `${base}=${v}`);
   }
 
+  const flowctlToken = resolveFlowctlToken(containerConfig.tools, credentialFolder);
+  if (flowctlToken) {
+    args.push('-e', `FLOW_AUTH_TOKEN=${flowctlToken}`);
+  } else if (flowctlDeclared(containerConfig.tools)) {
+    log.warn('flowctl tool declared but no Estuary key is set on the host', {
+      folder: credentialFolder,
+      envName: flowctlTokenEnvName(credentialFolder),
+    });
+  }
+
   // Raw connection strings (e.g. RENDER_PG_URL_<FOLDER>_MAIN) passed through verbatim. SECURITY: the tail must
   // START with the folder token followed by `_` or end-of-string; a substring match let one folder inherit
   // another folder's vars.
@@ -5174,6 +5190,9 @@ async function buildContainerArgs(
     }
     if (isToolEnabled(containerConfig.tools, 'aws')) {
       mergeNoProxy(args, 'amazonaws.com');
+    }
+    if (flowctlDeclared(containerConfig.tools)) {
+      for (const host of FLOWCTL_NO_PROXY_HOSTS) mergeNoProxy(args, host);
     }
     // git sends Basic auth; OneCLI treats github.com as a known provider and replaces the header with its
     // connected-app credential (401 for agents without a vault link).

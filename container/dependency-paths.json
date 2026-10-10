@@ -126,6 +126,7 @@
     "docker:railway": { "kind": "runtime" },
     "docker:supabase": { "kind": "runtime" },
     "docker:yq": { "kind": "runtime" },
-    "docker:hex-cli": { "kind": "runtime" }
+    "docker:hex-cli": { "kind": "runtime" },
+    "docker:flowctl": { "kind": "runtime" }
   }
 }
