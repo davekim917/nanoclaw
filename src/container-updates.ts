@@ -242,7 +242,11 @@ interface DockerUpdateSource {
     | { kind: 'pypi'; package: string }
     | { kind: 'github'; repo: string }
     | { kind: 'github-tags'; repo: string };
-  checksums?: Array<{ arg: string; url: string; filename?: string }>;
+  /**
+   * `url` returns a `.sha256` sidecar, or with `githubReleaseAsset` a GitHub release API document whose asset
+   * `digest` is read instead, for projects that publish no sidecar.
+   */
+  checksums?: Array<{ arg: string; url: string; filename?: string; githubReleaseAsset?: string }>;
   mirrors?: Array<{ file: string; jsonPath: string[]; format: string }>;
 }
 
@@ -817,6 +821,14 @@ function checksumFromText(text: string, filename?: string): string {
   return digest;
 }
 
+function checksumFromGitHubRelease(text: string, asset: string): string {
+  const release = JSON.parse(text) as { assets?: Array<{ name?: unknown; digest?: unknown }> };
+  const digest = release.assets?.find((candidate) => candidate.name === asset)?.digest;
+  const match = typeof digest === 'string' ? digest.match(/^sha256:([0-9a-f]{64})$/i) : null;
+  if (!match) throw new Error(`could not resolve SHA256 for release asset ${asset}`);
+  return match[1].toLowerCase();
+}
+
 function setJsonPath(target: Record<string, unknown>, parts: string[], value: string): void {
   let cursor: Record<string, unknown> = target;
   for (const part of parts.slice(0, -1)) {
@@ -893,7 +905,10 @@ export async function applySelectedUpdates(options: {
         (entry.checksums ?? []).map(async (checksum) => {
           const filename = checksum.filename ? substitute(checksum.filename, item.latest!) : undefined;
           const content = await fetchText(substitute(checksum.url, item.latest!));
-          return { arg: checksum.arg, digest: checksumFromText(content, filename) };
+          const digest = checksum.githubReleaseAsset
+            ? checksumFromGitHubRelease(content, substitute(checksum.githubReleaseAsset, item.latest!))
+            : checksumFromText(content, filename);
+          return { arg: checksum.arg, digest };
         }),
       );
       for (const checksum of checksums) {

@@ -89,3 +89,40 @@ describe('enable-agent-plugin next steps', () => {
     expect(out).toContain('ships its own always-on.md');
   });
 });
+
+describe('enable-agent-plugin Claude manifest for a marketplace repo', () => {
+  /** A repo shipping only `.claude-plugin/marketplace.json`, its plugins sourced from `sources`. */
+  function seedMarketplace(name: string, sources: string[]): string {
+    const dir = path.join(home, 'plugins', name);
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'skills', 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'skills', 'demo', 'SKILL.md'), '---\nname: demo\ndescription: d\n---\n');
+    fs.writeFileSync(
+      path.join(dir, '.claude-plugin', 'marketplace.json'),
+      JSON.stringify({ name, plugins: sources.map((source, i) => ({ name: `p${i}`, source, skills: [] })) }),
+    );
+    return dir;
+  }
+
+  function report(name: string): { generatedManifest: boolean } {
+    return JSON.parse(
+      execFileSync('npx', ['tsx', SCRIPT, name, '--dry-run', '--report-json'], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: home },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+    ) as { generatedManifest: boolean };
+  }
+
+  it.each([
+    // The container walk registers a directory only by plugin.json, so a marketplace whose plugins are all the
+    // repo root loads nothing on a Claude group unless the root gets one.
+    ['every plugin sourced from the repo root', ['./', '.'], true],
+    // Sub-plugins carry their own manifests; a root one would register the whole repo a second time.
+    ['plugins in sub-directories', ['./data', './'], false],
+  ])('generates a root manifest only when %s', (_label, sources, expected) => {
+    const dir = seedMarketplace('market', sources);
+    expect(report('market').generatedManifest).toBe(expected);
+    expect(fs.existsSync(path.join(dir, '.claude-plugin', 'plugin.json'))).toBe(false);
+  });
+});

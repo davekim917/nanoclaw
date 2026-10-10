@@ -20,6 +20,7 @@ import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-
 import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import { extractToolScopes } from './scoped-env.js';
+import { flowctlDeclared, flowctlTokenEnvName } from './flowctl-credential.js';
 
 let cachedVersion = '0.0.0';
 try {
@@ -566,6 +567,24 @@ export function buildSessionServicesSnapshotFrom(
           : `cloudflare tool declared but CLOUDFLARE_API_TOKEN not set at host — ask Operator.`,
       });
     }
+  }
+
+  if (flowctlDeclared(tools)) {
+    const envName = flowctlTokenEnvName(folder);
+    const tokenSet = Boolean(process.env[envName]);
+    services.push({
+      name: 'Estuary flowctl',
+      cli: 'flowctl',
+      declaredTools: declaredMatchingTools(['flowctl']),
+      scopes: [],
+      credentialPaths: [],
+      summary: tokenSet
+        ? 'Estuary flowctl: catalog list/draft/publish, logs, stats, task status for Estuary pipelines'
+        : `flowctl declared but ${envName} is unset on the host — ask the operator`,
+      activation: tokenSet
+        ? `\`flowctl\` authenticated as an Estuary service account through \`FLOW_AUTH_TOKEN\` (from host env \`${envName}\`); its reach is whatever prefixes that account was granted. Start with \`flowctl catalog list --prefix <prefix>/\`; inspect with \`flowctl catalog status\`, \`flowctl logs --task <name>\`, \`flowctl raw stats --task <name>\`; change specs with \`flowctl catalog pull-specs\`, edit, \`flowctl catalog test\`, then \`flowctl catalog publish --source <file>\` (it prompts unless \`--auto-approve\`). Never run \`flowctl auth login\` or \`flowctl auth token\`, and never print or echo \`FLOW_AUTH_TOKEN\`. A 401 means the key was revoked or expired: report it to the operator.`
+        : `flowctl tool declared but ${envName} is not set on the host — ask the operator to provision the Estuary service-account key.`,
+    });
   }
 
   // Derived MCP entries are spliced in here, not appended: both capability budgets evict from the end, and the
