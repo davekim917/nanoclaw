@@ -34,7 +34,7 @@ concurrency:
 jobs:
   typecheck:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nanoclaw]
     timeout-minutes: 10
     steps:
       # Full history, as ci-full.yml's `correctness` job does
